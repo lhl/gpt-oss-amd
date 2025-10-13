@@ -20,9 +20,12 @@ The script:
 import argparse
 import os
 import sys
+# Avoid torchvision import requirements in Transformers when we only do text.
+import os
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def paths_for_size(size: str):
@@ -56,23 +59,41 @@ def main():
     )
     args = p.parse_args()
 
-    default_src, default_dst = paths_for_size(args.size)
-    src = args.src or default_src
-    dst = args.dst or default_dst
+    if args.src or args.dst:
+        src = args.src or ""
+        dst = args.dst or ""
+    else:
+        default_src, default_dst = paths_for_size(args.size)
+        src = default_src
+        dst = default_dst
 
     if not os.path.isdir(src):
         print(f"ERROR: Source path does not exist: {src}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Loading tokenizer from {src} ...")
-    tok = AutoTokenizer.from_pretrained(src)
+    # Hide torchvision from Transformers to avoid optional deps
+    import importlib.util as _iu
+    _old_find_spec = _iu.find_spec
+    def _find_spec(name, *a, **kw):
+        if name == "torchvision" or name.startswith("torchvision."):
+            return None
+        return _old_find_spec(name, *a, **kw)
+    _iu.find_spec = _find_spec
+
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
 
     print(f"Loading model from {src} (bf16, eager attn)...")
+    from transformers import AutoConfig, AutoModelForCausalLM
+    config = AutoConfig.from_pretrained(src, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         src,
+        config=config,
         dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         attn_implementation="eager",
+        trust_remote_code=True,
     )
 
     print(f"Saving to {dst} ...")
