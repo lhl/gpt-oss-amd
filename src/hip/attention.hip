@@ -570,3 +570,17 @@ void fa(const float* q_batch, const void* k_cache, const void* v_cache, const fl
     }
     CHECK_HIP(hipGetLastError());
 }
+
+// C ABI wrapper to simplify unit testing linkage without exposing __hip_bfloat16
+extern "C" void fa_run(const float* q_batch, const void* k_cache, const void* v_cache,
+                       const float* mask, const __hip_bfloat16* attn_sinks, float* tb_batch,
+                       int B, int seq_len, int head_dim, int kv_dim, int kv_mul,
+                       int sliding_window, int layer_idx, int n_attn_heads, int kv_cache_is_fp16,
+                       const int* d_pos_per_token, const int* d_batch_indices, long long B_stride,
+                       int max_pos_in_batch, hipStream_t stream, const long long* d_layer_kv_off,
+                       const int* d_layer_kv_cap, const int* d_layer_is_local) {
+    fa(q_batch, k_cache, v_cache, mask, attn_sinks, tb_batch, B, seq_len, head_dim, kv_dim,
+       kv_mul, sliding_window, layer_idx, n_attn_heads, kv_cache_is_fp16, d_pos_per_token,
+       d_batch_indices, B_stride, max_pos_in_batch, stream, d_layer_kv_off, d_layer_kv_cap,
+       d_layer_is_local);
+}

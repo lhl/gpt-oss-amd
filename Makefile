@@ -84,8 +84,13 @@ RUN_ENV = LD_LIBRARY_PATH=$(LDLIB):$${LD_LIBRARY_PATH}
 TIMEOUT ?= 60
 
 .PHONY: quick-tests
-quick-tests: wmma-test wmma-gemm-bias-test
+quick-tests: wmma-test wmma-gemm-bias-test wmma-attn-test
 	@echo "Running wmma_test (timeout $(TIMEOUT)s)"
 	- timeout $(TIMEOUT) env $(RUN_ENV) ./build/wmma_test || true
 	@echo "Running wmma_gemm_bias_test (timeout $(TIMEOUT)s)"
 	- timeout $(TIMEOUT) env $(RUN_ENV) ./build/wmma_gemm_bias_test || true
+
+.PHONY: wmma-attn-test
+wmma-attn-test: tests/wmma_attention_test.cpp src/hip/attention.hip
+	$(CC) $(CFLAGS) -DTESTING -DOSS_USE_WMMA=1 -IrocWMMA/library/include -O3 \
+	  tests/wmma_attention_test.cpp src/hip/attention.hip -o build/wmma_attention_test
