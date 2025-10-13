@@ -166,10 +166,21 @@ __global__ void moe_mlp1_swiglu_mfma_kernel(const int* __restrict__ work_queue, 
                 if (n_col3 < MT_N)
                     b3 = *reinterpret_cast<const i16x4*>(&sB_ping[n_col3 * LDS_STRIDE_B + k_row_base]);
 
+#ifdef OSS_USE_WMMA
+                // Fallback accumulate for gfx11: component-wise bf16->f32 dot
+                for (int i = 0; i < 4; ++i) {
+                    float av = __bfloat162float(raw_to_bf16(avec_curr[i]));
+                    c0[i] += av * __bfloat162float(raw_to_bf16(b0[i]));
+                    c1[i] += av * __bfloat162float(raw_to_bf16(b1[i]));
+                    c2[i] += av * __bfloat162float(raw_to_bf16(b2[i]));
+                    c3[i] += av * __bfloat162float(raw_to_bf16(b3[i]));
+                }
+#else
                 c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b0, c0, 0, 0, 0);
                 c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b1, c1, 0, 0, 0);
                 c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b2, c2, 0, 0, 0);
                 c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b3, c3, 0, 0, 0);
+#endif
 
                 if (kk + 16 < BK)
                     avec_curr = avec_next;
@@ -420,10 +431,20 @@ __global__ void moe_mlp2_scatter_mfma_kernel(
                     b3 = *reinterpret_cast<const i16x4*>(
                         &sB_ping[n_col3 * LDS_STRIDE_B + k_row_base]);
 
+#ifdef OSS_USE_WMMA
+                for (int i = 0; i < 4; ++i) {
+                    float av = __bfloat162float(raw_to_bf16(avec_curr[i]));
+                    c0[i] += av * __bfloat162float(raw_to_bf16(b0[i]));
+                    c1[i] += av * __bfloat162float(raw_to_bf16(b1[i]));
+                    c2[i] += av * __bfloat162float(raw_to_bf16(b2[i]));
+                    c3[i] += av * __bfloat162float(raw_to_bf16(b3[i]));
+                }
+#else
                 c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b0, c0, 0, 0, 0);
                 c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b1, c1, 0, 0, 0);
                 c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b2, c2, 0, 0, 0);
                 c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec_curr, b3, c3, 0, 0, 0);
+#endif
 
                 if (kk + 16 < BK)
                     avec_curr = avec_next;
@@ -686,10 +707,20 @@ __global__ void moe_mlp2_store_mfma_kernel(
                     b3 = *reinterpret_cast<const i16x4*>(
                         &sB_ping[n_col3 * LDS_STRIDE_B + k_row_base]);
 
+#ifdef OSS_USE_WMMA
+                for (int i = 0; i < 4; ++i) {
+                    float av = __bfloat162float(raw_to_bf16(avec[i]));
+                    c0[i] += av * __bfloat162float(raw_to_bf16(b0[i]));
+                    c1[i] += av * __bfloat162float(raw_to_bf16(b1[i]));
+                    c2[i] += av * __bfloat162float(raw_to_bf16(b2[i]));
+                    c3[i] += av * __bfloat162float(raw_to_bf16(b3[i]));
+                }
+#else
                 c0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b0, c0, 0, 0, 0);
                 c1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b1, c1, 0, 0, 0);
                 c2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b2, c2, 0, 0, 0);
                 c3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(avec, b3, c3, 0, 0, 0);
+#endif
             }
             __syncthreads();
         }

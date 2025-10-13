@@ -280,8 +280,17 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
                     }
                 }
             }
+#ifdef OSS_USE_WMMA
+            // Scalar fallback accumulation for gfx11 while WMMA attention is in progress.
+            for (int i = 0; i < 4; ++i) {
+                float qf = bf16_to_f32_intr(raw_to_bf16(q_frag[frag_idx][i]));
+                float bf = bf16_to_f32_intr(raw_to_bf16(b_frag[i]));
+                score_frag[i] += qf * bf;
+            }
+#else
             score_frag = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(q_frag[frag_idx], b_frag,
                                                                    score_frag, 0, 0, 0);
+#endif
         }
 
         float score_reg[4];
@@ -428,10 +437,20 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
         i16x4 vb2 = load_v_fragment(n_col2);
         i16x4 vb3 = load_v_fragment(n_col3);
 
+#ifdef OSS_USE_WMMA
+        for (int i = 0; i < 4; ++i) {
+            float wf = bf16_to_f32_intr(raw_to_bf16(w_frag[i]));
+            o_frag0[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb0[i]));
+            o_frag1[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb1[i]));
+            o_frag2[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb2[i]));
+            o_frag3[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb3[i]));
+        }
+#else
         o_frag0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb0, o_frag0, 0, 0, 0);
         o_frag1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb1, o_frag1, 0, 0, 0);
         o_frag2 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb2, o_frag2, 0, 0, 0);
         o_frag3 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb3, o_frag3, 0, 0, 0);
+#endif
         __syncthreads();
     }
 
