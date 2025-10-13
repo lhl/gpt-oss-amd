@@ -1,9 +1,13 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#ifdef OSS_USE_WMMA
+#include <rocwmma/rocwmma.hpp>
+#endif
 
 
 // GEMM: A[M,K] bf16, B[N,K] fp32, C[N,M] fp32 (row-major by N)
+#ifndef OSS_USE_WMMA
 __global__ void gemm_bf16_f32_mfma_router(const __hip_bfloat16* __restrict__ A,    // [M,K] bf16
                                           const float* __restrict__ B,             // [N,K] f32
                                           float* __restrict__ C,                   // [N,M] f32
@@ -180,11 +184,78 @@ __global__ void gemm_bf16_f32_mfma_router(const __hip_bfloat16* __restrict__ A, 
         }
     }
 }
+#endif
+
+#ifdef OSS_USE_WMMA
+__global__ void gemm_bf16_f32_wmma_router(const __hip_bfloat16* __restrict__ A,    // [M,K] bf16
+                                          const float* __restrict__ B,             // [N,K] f32
+                                          float* __restrict__ C,                   // [N,M] f32
+                                          const __hip_bfloat16* __restrict__ bias, // [M]
+                                          int M, int N, int K) {
+    using namespace rocwmma;
+    constexpr int TM = 16, TN = 16, TK = 16;
+    int tile_m = blockIdx.x * TM;
+    int tile_n = blockIdx.y * TN;
+
+    fragment<accumulator, TM, TN, TK, float32_t> acc;
+    fill_fragment(acc, static_cast<float32_t>(0.0f));
+
+    extern __shared__ char smem[];
+    hip_bfloat16* sA = reinterpret_cast<hip_bfloat16*>(smem);
+    hip_bfloat16* sB = sA + (TN * TK);
+    float* sC = reinterpret_cast<float*>(sB + (TK * TM));
+
+    for (int k0 = 0; k0 < K; k0 += TK) {
+        for (int idx = threadIdx.x; idx < TN * TK; idx += blockDim.x) {
+            int r = idx / TK, c = idx % TK;
+            int n = tile_n + r, k = k0 + c;
+            hip_bfloat16 v = hip_bfloat16(0.0f);
+            if (n < N && k < K) v = hip_bfloat16(B[(size_t)n * K + k]);
+            sA[r * TK + c] = v;
+        }
+        for (int idx = threadIdx.x; idx < TK * TM; idx += blockDim.x) {
+            int r = idx / TM, c = idx % TM;
+            int m = tile_m + c, k = k0 + r;
+            hip_bfloat16 v = hip_bfloat16(0.0f);
+            if (m < M && k < K) v = hip_bfloat16(__bfloat162float(A[(size_t)m * K + k]));
+            sB[r * TM + c] = v;
+        }
+        __syncthreads();
+
+        fragment<matrix_a, TM, TN, TK, bfloat16_t, row_major> a_frag;
+        fragment<matrix_b, TM, TN, TK, bfloat16_t, row_major> b_frag;
+        load_matrix_sync(a_frag, sA, TK);
+        load_matrix_sync(b_frag, sB, TM);
+        mma_sync(acc, a_frag, b_frag, acc);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) for (int i = 0; i < TN * TM; ++i) sC[i] = 0.0f;
+    __syncthreads();
+    store_matrix_sync(sC, acc, TM, mem_row_major);
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < TN * TM; idx += blockDim.x) {
+        int r = idx / TM, c = idx % TM;
+        int n = tile_n + r, m = tile_m + c;
+        if (n < N && m < M) {
+            float val = sC[r * TM + c];
+            float b = (bias && m < M) ? __bfloat162float(bias[m]) : 0.0f;
+            C[(size_t)n * M + m] = val + b;
+        }
+    }
+}
+#endif
 
 void gemm_router(float* xout, const float* x_batch, const __hip_bfloat16* w,
                  const __hip_bfloat16* bias, int N, int K, int M, hipStream_t stream) {
+#ifdef OSS_USE_WMMA
+    dim3 grid((M + 15) / 16, (N + 15) / 16);
+    dim3 block(32, 1, 1);
+    size_t shmem = (16 * 16 + 16 * 16) * sizeof(hip_bfloat16) + 16 * 16 * sizeof(float);
+    hipLaunchKernelGGL(gemm_bf16_f32_wmma_router, grid, block, shmem, stream, w, x_batch, xout,
+                       bias, M, N, K);
+#else
     dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 256));
     dim3 block(1024, 1, 1);
-
     gemm_bf16_f32_mfma_router<<<grid, block, 0, stream>>>(w, x_batch, xout, bias, M, N, K);
+#endif
 }

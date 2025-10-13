@@ -1,8 +1,13 @@
+// gfx9x MFMA path; gfx11 WMMA path (rocWMMA)
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#ifdef OSS_USE_WMMA
+#include <rocwmma/rocwmma.hpp>
+#endif
 
-// GEMM: A[M,K] bf16, B[N,K] fp32, C[N,M] fp32 (row-major by N)
+#ifndef OSS_USE_WMMA
+// GEMM: A[M,K] bf16, B[N,K] fp32, C[N,M] fp32 (row-major by N), MFMA path
 __global__ void gemm_bf16_f32_mfma_logits(const __hip_bfloat16* __restrict__ A, // [M,K] bf16
                                           const float* __restrict__ B,          // [N,K] f32
                                           float* __restrict__ C,                // [N,M] f32
@@ -167,10 +172,108 @@ __global__ void gemm_bf16_f32_mfma_logits(const __hip_bfloat16* __restrict__ A, 
         }
     }
 }
+#else
 
+// Simple WMMA-based GEMM kernel for gfx11: C[N,M] = A[M,K] (bf16) @ B[N,K]^T (f32 -> bf16)
+// Operates on 16x16x16 tiles, one wave32 per tile. Stages B as bf16 in LDS.
+__device__ __forceinline__ hip_bfloat16 f32_to_bf16(float val) { return hip_bfloat16(val); }
+
+__global__ void gemm_bf16_f32_wmma_logits(const __hip_bfloat16* __restrict__ A, // [M,K] bf16
+                                          const float* __restrict__ B,          // [N,K] f32
+                                          float* __restrict__ C,                // [N,M] f32
+                                          int M, int N, int K) {
+    using namespace rocwmma;
+    constexpr int TM = 16, TN = 16, TK = 16;
+
+    // tile indices: grid.x covers M in tiles; grid.y covers N in tiles
+    int tile_m = blockIdx.x * TM;
+    int tile_n = blockIdx.y * TN;
+
+    // Accumulator for 16x16 tile (float32)
+    fragment<accumulator, TM, TN, TK, float32_t> acc;
+    fill_fragment(acc, static_cast<float32_t>(0.0f));
+
+    extern __shared__ char smem[];
+    hip_bfloat16* sA = reinterpret_cast<hip_bfloat16*>(smem);                        // [TN, TK]
+    hip_bfloat16* sB = sA + (TN * TK);                                              // [TK, TM]
+
+    // Loop over K in 16-chunks
+    for (int k0 = 0; k0 < K; k0 += TK) {
+        // Stage A_tile: from B[N,K] -> sA[Ntile, Ktile] as bf16
+        // Stage B_tile: from A[M,K] -> sB[Ktile, Mtile] as bf16
+        for (int idx = threadIdx.x; idx < TN * TK; idx += blockDim.x) {
+            int r = idx / TK; // 0..15 (Ntile)
+            int c = idx % TK; // 0..15 (Ktile)
+            hip_bfloat16 v = hip_bfloat16(0.0f);
+            int n = tile_n + r;
+            int k = k0 + c;
+            if (n < N && k < K) {
+                v = f32_to_bf16(B[(size_t)n * K + k]);
+            }
+            sA[r * TK + c] = v;
+        }
+        for (int idx = threadIdx.x; idx < TK * TM; idx += blockDim.x) {
+            int r = idx / TM; // 0..15 (Ktile)
+            int c = idx % TM; // 0..15 (Mtile)
+            hip_bfloat16 v = hip_bfloat16(0.0f);
+            int m = tile_m + c;
+            int k = k0 + r;
+            if (m < M && k < K) {
+                v = hip_bfloat16(__bfloat162float(A[(size_t)m * K + k]));
+            }
+            sB[r * TM + c] = v;
+        }
+        __syncthreads();
+
+        // Load fragments from LDS
+        fragment<matrix_a, TM, TN, TK, bfloat16_t, row_major> a_frag;
+        fragment<matrix_b, TM, TN, TK, bfloat16_t, row_major> b_frag;
+        load_matrix_sync(a_frag, sA, TK);
+        load_matrix_sync(b_frag, sB, TM);
+
+        // MMA
+        mma_sync(acc, a_frag, b_frag, acc);
+        __syncthreads();
+    }
+
+    // Store accumulator to global C (row-major N x M)
+    // We use a temp fragment for store
+    fragment<accumulator, TM, TN, TK, float32_t> c_frag = acc;
+    // Bounds-safe store: use a guarded path
+    for (int i = 0; i < c_frag.num_elements; ++i) {
+        // Use rocWMMA store helper into a temp tile in shared, then scatter
+    }
+
+    // Use rocWMMA store_matrix_sync to a temporary scratch (reuse s_mem)
+    float* sC = reinterpret_cast<float*>(sB + (TK * TM));
+    __syncthreads();
+    store_matrix_sync(sC, c_frag, TM, mem_row_major); // sC is [TN x TM] row-major by TM
+    __syncthreads();
+
+    // Scatter to global with bounds checks
+    for (int idx = threadIdx.x; idx < TN * TM; idx += blockDim.x) {
+        int r = idx / TM; // 0..15 (Ntile)
+        int c = idx % TM; // 0..15 (Mtile)
+        int n = tile_n + r;
+        int m = tile_m + c;
+        if (n < N && m < M) {
+            C[(size_t)n * M + m] = sC[r * TM + c];
+        }
+    }
+}
+
+void gemm_logits(float* xout, const float* x_batch, const __hip_bfloat16* w, int N, int K, int M, hipStream_t stream) {
+    dim3 grid((M + 15) / 16, (N + 15) / 16);
+    dim3 block(32, 1, 1);
+    size_t shmem = (16 * 16 + 16 * 16) * sizeof(hip_bfloat16) + 16 * 16 * sizeof(float);
+    hipLaunchKernelGGL(gemm_bf16_f32_wmma_logits, grid, block, shmem, stream, w, x_batch, xout, M, N, K);
+}
+#endif
+
+#ifndef OSS_USE_WMMA
 void gemm_logits(float* xout, const float* x_batch, const __hip_bfloat16* w, int N, int K, int M, hipStream_t stream) {
     dim3 grid(CEIL_DIV(N, 64), CEIL_DIV(M, 256));
     dim3 block(1024, 1, 1);
-
     gemm_bf16_f32_mfma_logits<<<grid, block, 0, stream>>>(w, x_batch, xout, M, N, K);
 }
+#endif
