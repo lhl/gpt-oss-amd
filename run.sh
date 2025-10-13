@@ -385,16 +385,40 @@ cmd_run() {
   [[ -n "${kv32_flag}" ]] && args+=(--kv32)
   [[ -n "${odd_win}" ]] && args+=(--odd_win "${odd_win}")
 
-  local srun_cmd="srun --gres=gpu:${n_gpus}"
-  print_command "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
+  # Choose launcher: use srun if available/under SLURM or FORCE_SRUN is set; otherwise run directly.
+  local runner_cmd=()
+  if command -v srun >/dev/null 2>&1 && [[ -n "${SLURM_JOB_ID:-}" || -n "${SLURM_CLUSTER_NAME:-}" || -n "${FORCE_SRUN:-}" ]]; then
+    runner_cmd=(srun --gres=gpu:${n_gpus})
+  else
+    if [[ "${n_gpus}" != "1" ]]; then
+      print_warning "srun not found; running directly. Ensure ${n_gpus} GPUs are visible (HIP_VISIBLE_DEVICES)."
+    fi
+    runner_cmd=()
+  fi
+
+  if [[ ${#runner_cmd[@]} -gt 0 ]]; then
+    print_command "${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-}"
+  else
+    print_command "build/run \"${ckpt}\" ${args[*]:-}"
+  fi
 
   if [[ -n "${log_output}" ]]; then
     print_info "logging output to log.txt"
-    print_executing "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
-    ${srun_cmd} build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
+    if [[ ${#runner_cmd[@]} -gt 0 ]]; then
+      print_executing "${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
+      "${runner_cmd[@]}" build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
+    else
+      print_executing "build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
+      build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
+    fi
   else
-    print_executing "${srun_cmd} build/run \"${ckpt}\" ${args[*]:-}"
-    ${srun_cmd} build/run "${ckpt}" "${args[@]:-}"
+    if [[ ${#runner_cmd[@]} -gt 0 ]]; then
+      print_executing "${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-}"
+      "${runner_cmd[@]}" build/run "${ckpt}" "${args[@]:-}"
+    else
+      print_executing "build/run \"${ckpt}\" ${args[*]:-}"
+      build/run "${ckpt}" "${args[@]:-}"
+    fi
   fi
 }
 
@@ -467,6 +491,37 @@ cmd_tokenizer() {
       make tokenizer-bin
       print_success "Tokenizer export completed"
       ;;
+    export)
+      # Model exporter: converts HF safetensors to our .bin
+      local model_id=""
+      local revision=""
+      local snapshot=""
+      local out="gpt-oss.bin"
+      local print_keys=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model-id) model_id="$2"; shift 2 ;;
+          --revision) revision="$2"; shift 2 ;;
+          --snapshot) snapshot="$2"; shift 2 ;;
+          -o|--out) out="$2"; shift 2 ;;
+          --print-keys) print_keys="1"; shift 1 ;;
+          -h|--help) echo "Usage: ./run.sh export [--model-id ID|--snapshot DIR] [-o OUT] [--revision REV] [--print-keys]"; exit 0 ;;
+          *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        esac
+      done
+      print_header "${CYAN}" "EXPORT MODEL"
+      [[ -n "${model_id}" ]] && print_kv "model-id" "${model_id}" || print_kv "snapshot" "${snapshot:-<unset>}"
+      print_kv "revision" "${revision:-<unset>}"
+      print_kv "out" "${out}"
+      local cmd=(python3 tools/export_model_bin.py -o "${out}")
+      [[ -n "${model_id}" ]] && cmd+=(--model-id "${model_id}")
+      [[ -n "${revision}" ]] && cmd+=(--revision "${revision}")
+      [[ -n "${snapshot}" ]] && cmd+=(--snapshot "${snapshot}")
+      [[ -n "${print_keys}" ]] && cmd+=(--print-keys)
+      print_command "${cmd[*]}"
+      print_executing "${cmd[*]}"
+      "${cmd[@]}"
+      ;;
     test)
       local tokbin="build/tokenizer.bin"
       local prompt="Hello world"
@@ -529,6 +584,37 @@ main() {
     all)       cmd_all "$@" ;;
     decode)    cmd_decode "$@" ;;
     tokenizer) cmd_tokenizer "$@" ;;
+    export)
+      # Model exporter: converts HF safetensors to our .bin
+      local model_id=""
+      local revision=""
+      local snapshot=""
+      local out="gpt-oss.bin"
+      local print_keys=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model-id) model_id="$2"; shift 2 ;;
+          --revision) revision="$2"; shift 2 ;;
+          --snapshot) snapshot="$2"; shift 2 ;;
+          -o|--out) out="$2"; shift 2 ;;
+          --print-keys) print_keys="1"; shift 1 ;;
+          -h|--help) echo "Usage: ./run.sh export [--model-id ID|--snapshot DIR] [-o OUT] [--revision REV] [--print-keys]"; exit 0 ;;
+          *) echo "Unknown argument: $1" >&2; exit 1 ;;
+        esac
+      done
+      print_header "${CYAN}" "EXPORT MODEL"
+      [[ -n "${model_id}" ]] && print_kv "model-id" "${model_id}" || print_kv "snapshot" "${snapshot:-<unset>}"
+      print_kv "revision" "${revision:-<unset>}"
+      print_kv "out" "${out}"
+      local cmd=(python3 tools/export_model_bin.py -o "${out}")
+      [[ -n "${model_id}" ]] && cmd+=(--model-id "${model_id}")
+      [[ -n "${revision}" ]] && cmd+=(--revision "${revision}")
+      [[ -n "${snapshot}" ]] && cmd+=(--snapshot "${snapshot}")
+      [[ -n "${print_keys}" ]] && cmd+=(--print-keys)
+      print_command "${cmd[*]}"
+      print_executing "${cmd[*]}"
+      "${cmd[@]}"
+      ;;
     test)
       # Quick kernel-level tests with timeout; usage: ./run.sh test [-t SECONDS]
       local to=30
