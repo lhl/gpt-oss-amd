@@ -51,7 +51,7 @@ def open_all_safetensors(dir_path: Path) -> Dict[str, Tuple[Path, str]]:
     m: Dict[str, Tuple[Path, str]] = {}
     for fp in dir_path.glob("**/*.safetensors"):
         try:
-            with safe_open(fp, framework="numpy") as f:
+            with safe_open(fp, framework='pt') as f:
                 for k in f.keys():
                     arr = f.get_tensor(k)
                     m[k] = (fp, str(arr.dtype))
@@ -60,11 +60,24 @@ def open_all_safetensors(dir_path: Path) -> Dict[str, Tuple[Path, str]]:
     return m
 
 def load_tensor(fp: Path, key: str) -> np.ndarray:
-    with safe_open(fp, framework="numpy") as f:
-        return f.get_tensor(key).astype(np.float32, copy=False)
+    with safe_open(fp, framework='pt') as f:
+        import torch
+        t=f.get_tensor(key)
+    if hasattr(t,'to'):
+        return t.detach().cpu().to(torch.float32).numpy()
+    return np.array(t, dtype=np.float32)
 
 def guess_mapper(keys: Iterable[str]) -> str:
+    """Best-effort mapper detection.
+
+    Prefer the HF layout if both patterns appear (some repos ship both fused
+    and HF-style weights). Fall back to fused GPT-OSS layout otherwise.
+    """
     ks = set(keys)
+    # Prefer HF-style if present
+    if any("model.layers.0.self_attn.q_proj.weight" in k for k in ks):
+        return "hf_gpt_oss"
+    # Original fused GPT-OSS layout
     if any("attn.qkv.weight" in k for k in ks):
         return "gpt_oss"
     return "unknown"
@@ -209,7 +222,7 @@ def export_gpt_oss(model_dir: Path, out_path: Path) -> None:
         write_arr(np.stack(w_o_list, axis=0))
         write_arr(np.stack(b_o_list, axis=0))
         write_arr(np.stack(attn_sinks_list, axis=0))
-        if w_router_list:
+        if w_router_list and w_mlp1_list and w_mlp2_list:
             write_arr(np.stack(w_router_list, axis=0))
             write_arr(np.stack(b_router_list, axis=0))
             write_arr(np.stack(w_mlp1_list, axis=0))
@@ -227,6 +240,153 @@ def resolve_model(model_id: str, revision: Optional[str], local_dir: Optional[st
         return p
     cache_dir = snapshot_download(repo_id=model_id, revision=revision, allow_patterns=["*.json", "*.safetensors"], local_files_only=False)
     return Path(cache_dir)
+
+
+
+def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
+    cfg_path = model_dir / "config.json"
+    if not cfg_path.is_file():
+        print(f"[ERROR] Missing {cfg_path}", file=sys.stderr)
+        sys.exit(2)
+    cfg = json.loads(cfg_path.read_text())
+    vocab_size = int(cfg.get("vocab_size"))
+    hidden_dim = int(cfg.get("hidden_size", cfg.get("hidden_dim")))
+    n_layers = int(cfg.get("num_hidden_layers"))
+    n_attn_heads = int(cfg.get("num_attention_heads"))
+    n_kv_heads = int(cfg.get("num_key_value_heads", n_attn_heads))
+    head_dim = int(cfg.get("head_dim", hidden_dim // max(1,n_attn_heads)))
+    seq_len = int(cfg.get("max_position_embeddings", 2048))
+    initial_context_length = int(cfg.get("initial_context_length", seq_len))
+    rope_theta = float(cfg.get("rope_theta", 150000.0))
+    rope_scaling_factor = float((cfg.get("rope_scaling") or {}).get("factor", 32.0))
+    sliding_window = int(cfg.get("sliding_window", 0))
+    swiglu_limit = float(cfg.get("swiglu_limit", 7.0))
+    n_experts = int(cfg.get("num_local_experts", 0))
+    experts_per_token = int(cfg.get("experts_per_token", cfg.get("num_experts_per_tok", 0)))
+
+    expcfg = ExportConfig(
+        vocab_size=vocab_size,
+        hidden_dim=hidden_dim,
+        n_experts=n_experts,
+        experts_per_token=experts_per_token,
+        intermediate_dim=int(cfg.get("intermediate_size", hidden_dim)),
+        n_layers=n_layers,
+        head_dim=head_dim,
+        n_attn_heads=n_attn_heads,
+        n_kv_heads=n_kv_heads,
+        seq_len=seq_len,
+        initial_context_length=initial_context_length,
+        rope_theta=rope_theta,
+        rope_scaling_factor=rope_scaling_factor,
+        sliding_window=sliding_window,
+        swiglu_limit=swiglu_limit,
+    )
+
+    ktf = open_all_safetensors(model_dir)
+    def K(*parts):
+        return ".".join(parts)
+    def get(k):
+        if k not in ktf:
+            return None
+        fp,_=ktf[k]
+        return load_tensor(fp,k)
+    # Embeddings
+    token_embedding = get(K("model","embed_tokens","weight"))
+    out_weight = get("lm_head.weight")
+    if token_embedding is None or out_weight is None:
+        print("[ERROR] Missing embeddings in HF snapshot", file=sys.stderr)
+        sys.exit(11)
+
+    # Per-layer
+    rms_attn_list=[]; rms_ffn_list=[]; w_qkv_list=[]; b_qkv_list=[]; w_o_list=[]; b_o_list=[]; sinks_list=[]
+    w_router_list=[]; b_router_list=[]; w_mlp1_list=[]; b_mlp1_list=[]; w_mlp2_list=[]; b_mlp2_list=[]
+
+    for i in range(n_layers):
+        rms_attn = get(K("model","layers",str(i),"input_layernorm","weight"))
+        rms_ffn = get(K("model","layers",str(i),"post_attention_layernorm","weight"))
+        if rms_attn is None or rms_ffn is None:
+            print(f"[ERROR] Missing norms for layer {i}", file=sys.stderr); sys.exit(12)
+        rms_attn_list.append(rms_attn.reshape(-1))
+        rms_ffn_list.append(rms_ffn.reshape(-1))
+        # QKV fuse
+        q = get(K("model","layers",str(i),"self_attn","q_proj","weight"))
+        k = get(K("model","layers",str(i),"self_attn","k_proj","weight"))
+        v = get(K("model","layers",str(i),"self_attn","v_proj","weight"))
+        qb = get(K("model","layers",str(i),"self_attn","q_proj","bias"))
+        kb = get(K("model","layers",str(i),"self_attn","k_proj","bias"))
+        vb = get(K("model","layers",str(i),"self_attn","v_proj","bias"))
+        if any(x is None for x in (q,k,v,qb,kb,vb)):
+            print(f"[ERROR] Missing QKV for layer {i}", file=sys.stderr); sys.exit(13)
+        w_qkv_list.append(np.concatenate([q,k,v], axis=0))
+        b_qkv_list.append(np.concatenate([qb.reshape(-1),kb.reshape(-1),vb.reshape(-1)], axis=0))
+        o = get(K("model","layers",str(i),"self_attn","o_proj","weight"))
+        ob = get(K("model","layers",str(i),"self_attn","o_proj","bias"))
+        if o is None or ob is None:
+            print(f"[ERROR] Missing O for layer {i}", file=sys.stderr); sys.exit(14)
+        w_o_list.append(o)
+        b_o_list.append(ob.reshape(-1))
+        sinks = get(K("model","layers",str(i),"self_attn","sinks"))
+        sinks_list.append(sinks.reshape(-1) if sinks is not None else np.zeros((n_attn_heads,),dtype=np.float32))
+        # Router
+        wr = get(K("model","layers",str(i),"mlp","router","weight"))
+        br = get(K("model","layers",str(i),"mlp","router","bias"))
+        if wr is not None and br is not None and n_experts>0:
+            w_router_list.append(wr.T)  # to (H, E)
+            b_router_list.append(br.reshape(-1))
+        # Experts
+        gu = get(K("model","layers",str(i),"mlp","experts","gate_up_proj"))
+        gub = get(K("model","layers",str(i),"mlp","experts","gate_up_proj_bias"))
+        dn = get(K("model","layers",str(i),"mlp","experts","down_proj"))
+        dnb = get(K("model","layers",str(i),"mlp","experts","down_proj_bias"))
+        if n_experts>0 and all(x is not None for x in (gu,gub,dn,dnb)):
+            # gu: (E, H, 2I) -> (E, 2I, H)
+            w_mlp1_list.append(np.transpose(gu,(0,2,1)))
+            b_mlp1_list.append(gub)
+            # dn: (E, H, I) already matches (E, H, I)
+            w_mlp2_list.append(dn)
+            b_mlp2_list.append(dnb)
+
+    # Final norm
+    rms_out = get("model.norm.weight")
+    if rms_out is None:
+        rms_out = get("final_layernorm.weight")
+    if rms_out is None:
+        print("[ERROR] Missing final norm", file=sys.stderr); sys.exit(15)
+
+    # Sanity for MoE: if experts are expected but expert weights are missing (likely quantized
+    # snapshot with blocks/scales), instruct user to dequantize first.
+    if n_experts>0:
+        have_router = len(w_router_list)>0
+        have_experts = len(w_mlp1_list)>0 and len(w_mlp2_list)>0
+        if have_router and not have_experts:
+            import sys
+            msg = (
+                "[ERROR] MoE router found but expert weights missing. "
+                "If your snapshot is quantized (e.g., mxfp4), dequantize to BF16 first:\
+"
+                "  python3 tools/dequantize_to_bf16.py 20b --src <HF-snapshot> --dst <bf16-dir>\\n"
+                "Then export with --snapshot <bf16-dir>"
+            )
+            print("".join(msg), file=sys.stderr)
+            sys.exit(16)
+
+    # Write
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open('wb') as f:
+        f.write(expcfg.pack_le())
+        def W(a):
+            a=np.asarray(a, dtype=np.float32, order='C'); f.write(a.tobytes(order='C'))
+        W(token_embedding); W(out_weight)
+        W(np.stack(rms_attn_list,0)); W(np.stack(rms_ffn_list,0)); W(rms_out.reshape(-1))
+        W(np.stack(w_qkv_list,0)); W(np.stack(b_qkv_list,0))
+        W(np.stack(w_o_list,0)); W(np.stack(b_o_list,0))
+        W(np.stack(sinks_list,0))
+        if w_router_list and w_mlp1_list and w_mlp2_list:
+            W(np.stack(w_router_list,0)); W(np.stack(b_router_list,0))
+            W(np.stack(w_mlp1_list,0)); W(np.stack(b_mlp1_list,0))
+            W(np.stack(w_mlp2_list,0)); W(np.stack(b_mlp2_list,0))
+    print(f"[OK] Exported model to {out_path}")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Export HF GPT-OSS model to gpt-oss-amd .bin")
@@ -248,6 +408,8 @@ def main() -> None:
     mapper = guess_mapper(ktf.keys())
     if mapper == "gpt_oss":
         export_gpt_oss(model_dir, Path(args.out))
+    elif mapper == "hf_gpt_oss":
+        export_hf_gpt_oss(model_dir, Path(args.out))
     else:
         print("[ERROR] Unsupported or unknown model mapping. Use --print-keys to inspect keys.")
         sys.exit(10)
