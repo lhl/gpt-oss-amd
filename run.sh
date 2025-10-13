@@ -529,6 +529,21 @@ main() {
     all)       cmd_all "$@" ;;
     decode)    cmd_decode "$@" ;;
     tokenizer) cmd_tokenizer "$@" ;;
+    test)
+      # Quick kernel-level tests with timeout; usage: ./run.sh test [-t SECONDS]
+      local to=30
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -t|--timeout) to="$2"; shift 2 ;;
+          *) break ;;
+        esac
+      done
+      print_header "${CYAN}" "TESTS"
+      print_kv "timeout" "${to}s"
+      print_step "make quick-tests (WMMA unit tests)"
+      print_executing "make quick-tests TIMEOUT=${to} GPU_ARCH=gfx1151"
+      make quick-tests TIMEOUT=${to} GPU_ARCH=gfx1151
+      ;;
     -h|--help|help) usage ;;
     *) echo "Unknown subcommand: ${sub}"; usage; exit 1 ;;
   esac
