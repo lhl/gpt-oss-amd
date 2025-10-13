@@ -4,6 +4,7 @@
 #include "../model.cpp"
 #include "../sampler.cpp"
 #include "eval.cpp"
+#include "../../include/profiling.hpp"
 
 #include <algorithm>
 #include <atomic>

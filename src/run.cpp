@@ -20,6 +20,7 @@
 #endif
 
 #include "../include/tokenizer.hpp"
+#include "../include/profiling.hpp"
 
 // ----------------------------------------------------------------------------
 
@@ -1071,8 +1072,14 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     free(prompt_tokens);
 }
 
+#ifndef OSS_ENABLE_GETP
+#define OSS_ENABLE_GETP 1
+#endif
+
+#if OSS_ENABLE_GETP
 #include "getp/eval.cpp"
 #include "getp/run.cpp"
+#endif
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
@@ -1232,8 +1239,16 @@ int main(int argc, char** argv) {
     } else if (strcmp(mode, "chat") == 0) {
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     } else if (strcmp(mode, "getp") == 0) {
+#if OSS_ENABLE_GETP
         getp(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps, batch_size,
              verify_filename, truncate_lines, use_kv16, odd_window);
+#else
+        fprintf(stderr, "getp mode is not available in this build (gfx11 CPU-only).\n");
+        free_sampler(&sampler);
+        free_tokenizer(&tokenizer);
+        free_transformer(&transformer);
+        return 1;
+#endif
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
