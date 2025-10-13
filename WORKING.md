@@ -12,6 +12,21 @@ Environment
 - ROCm: requires lib path, e.g. `LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH`
 - Build arch: auto-detected; override with `GPU_ARCH=gfx1151`
 
+
+Model Export (HF → .bin)
+- If your HF snapshot is already BF16 float weights:
+  - `./run.sh export --snapshot /path/to/snapshot -o gpt-oss-20b.bin`
+- If your HF model is quantized (e.g., mxfp4, blocks/scales):
+  1) Dequantize to BF16 safetensors via Transformers (requires `accelerate`):
+     - `pip install accelerate safetensors huggingface_hub transformers`
+     - `python3 tools/dequantize_to_bf16.py 20b --src ~/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/<hash> --dst /path/to/gpt-oss-20b-bf16`
+  2) Export to .bin:
+     - `./run.sh export --snapshot /path/to/gpt-oss-20b-bf16 -o gpt-oss-20b.bin`
+
+Notes
+- `./run.sh export --model-id openai/gpt-oss-20b -o gpt-oss-20b.bin` works for BF16 snapshots. If you see `[ERROR] MoE router found but expert weights missing...]`, your snapshot is quantized; run dequantization first (see above).
+- The exporter supports both fused GPT-OSS and HF layouts; it prefers HF when both are present. It fuses HF `q_proj/k_proj/v_proj` into `qkv` per layer and maps router/experts to our runtime order.
+
 What works now
 - `./run.sh build` builds `build/run` on gfx1151
 - WMMA GEMM kernels compile and pass quick CPU-vs-GPU numeric checks (bf16 x f32 -> f32)
@@ -43,15 +58,16 @@ How to run quick tests
 Next steps (short term)
 - Attention (WMMA):
   - Replace scalar fallback with WMMA fragments for Q·K^T and V aggregation (head_dim=64 tiles)
-  - Validate with a targeted attention unit test (small B,H,T)
+  - [Done] Validate with a targeted attention unit test (small B,H,T); integrated into quick-tests
 - MoE (WMMA or fallback):
   - MLP1/MLP2 kernels: upgrade from scalar fallback to WMMA where dense; keep fallback otherwise
   - Add a minimal MoE unit test (single layer, tiny expert set) [optional, since GEMM tests pass]
 - End-to-end smoke: run `./run.sh run -m 20 -g 1 -b 1 -n 64 -t 4 -f` with a valid checkpoint to confirm functional getp on gfx11
+  - Or explicitly pass your exported checkpoint: `./run.sh run -c ./gpt-oss-20b.bin -m getp -i tests/data/input.txt -o tests/data/output.txt -n 64 -b 1 -t 4 -f`
 
 Todo checklist
 - [ ] Implement WMMA attention tiles (Q·K^T and scores·V), replace scalar fallback
-- [ ] Add attention unit test (with/without mask) and include in quick-tests
+- [x] Add attention unit test (unmasked, small shapes) and include in quick-tests
 - [ ] (Optional) Implement WMMA in MoE MLP1/MLP2 where dense; retain scalar fallback for sparse cases
 - [ ] Run end-to-end getp smoke on gfx11 with a small batch/step budget
 - [ ] Performance pass: tune block sizes/tiling and LDS use on gfx11; compare against MFMA on gfx9x
@@ -62,3 +78,5 @@ Validation plan
 
 Notes
 - WMMA attention is more involved than GEMM; the scalar fallback exists to keep forward progress. We will replace it with a proper WMMA implementation using `rocWMMA` or direct `__builtin_amdgcn_wmma_*` intrinsics once verified.
+ - Launcher: `run.sh` falls back to direct execution when `srun` (Slurm) is unavailable. Set `FORCE_SRUN=1` to force Slurm.
+ - Libraries: If you see ROCm runtime errors during tests, ensure `LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH`.
