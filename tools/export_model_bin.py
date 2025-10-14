@@ -12,20 +12,38 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
+try:
+    from tqdm import tqdm  # progress bar
+except Exception:
+    def tqdm(x, **kwargs):
+        return x
 
 class TensorReader:
-    def __init__(self):
-        self._files = {}  # Path -> safe_open handle
+    def __init__(self, prefer_np: bool = True):
+        self._files = {}  # key: (framework, path) -> handle
+        self.prefer_np = prefer_np
+    def _open(self, fp, framework: str):
+        h = safe_open(fp, framework=framework)
+        self._files[(framework, str(fp))] = h
+        return h
     def get_tensor(self, fp, key: str):
-        f = self._files.get(str(fp))
-        if f is None:
-            f = safe_open(fp, framework='pt')
-            self._files[str(fp)] = f
-        return f.get_tensor(key)
-    def close(self):
-        for f in list(self._files.values()):
+        # Try numpy first for speed; fallback to PyTorch if unavailable
+        fw_order = (('np','pt') if self.prefer_np else ('pt','np'))
+        last_err = None
+        for fw in fw_order:
+            h = self._files.get((fw, str(fp)))
             try:
-                f.close()
+                if h is None:
+                    h = self._open(fp, fw)
+                return h.get_tensor(key)
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err if last_err else RuntimeError('Failed to load tensor')
+    def close(self):
+        for h in list(self._files.values()):
+            try:
+                h.close()
             except Exception:
                 pass
         self._files.clear()
@@ -83,11 +101,17 @@ def open_all_safetensors(dir_path: Path) -> Dict[str, Tuple[Path, str]]:
     return m
 
 def load_tensor_from(reader: TensorReader, fp: Path, key: str) -> np.ndarray:
-    import torch
     t = reader.get_tensor(fp, key)
-    if hasattr(t, "to"):
-        return t.detach().cpu().to(torch.float32).numpy()
-    return np.array(t, dtype=np.float32)
+    if hasattr(t, 'detach') or hasattr(t, 'to'):
+        try:
+            import torch  # type: ignore
+            return t.detach().cpu().to(torch.float32).numpy()
+        except Exception:
+            try:
+                return np.array(t.cpu().numpy(), dtype=np.float32)
+            except Exception:
+                pass
+    return np.asarray(t, dtype=np.float32)
 
 def guess_mapper(keys: Iterable[str]) -> str:
     """Best-effort mapper detection.
@@ -305,7 +329,7 @@ def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
     )
 
     ktf = open_all_safetensors(model_dir)
-    reader = TensorReader()
+    reader = TensorReader(prefer_np=True)
     def K(*parts):
         return ".".join(parts)
     def get_arr(k):
@@ -369,9 +393,9 @@ def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
             b_mlp2_list.append(dnb)
 
     # Final norm
-    rms_out = get("model.norm.weight")
+    rms_out = get_arr("model.norm.weight")
     if rms_out is None:
-        rms_out = get("final_layernorm.weight")
+        rms_out = get_arr("final_layernorm.weight")
     if rms_out is None:
         print("[ERROR] Missing final norm", file=sys.stderr); sys.exit(15)
 
@@ -399,23 +423,23 @@ def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
         def W(a):
             a=np.asarray(a, dtype=np.float32, order='C'); f.write(a.tobytes(order='C'))
         W(token_embedding); W(out_weight)
-        for ii in range(n_layers): W(rms_attn_list[ii].reshape(-1))
-        for ii in range(n_layers): W(rms_ffn_list[ii].reshape(-1))
+        for ii in tqdm(range(n_layers), desc='rms_attn', leave=False): W(rms_attn_list[ii].reshape(-1))
+        for ii in tqdm(range(n_layers), desc='rms_ffn', leave=False): W(rms_ffn_list[ii].reshape(-1))
         W(rms_out.reshape(-1))
-        for ii in range(n_layers):
+        for ii in tqdm(range(n_layers), desc='qkv', leave=False):
             q,k,v = w_qkv_list[ii]; W(q); W(k); W(v)
-        for ii in range(n_layers):
+        for ii in tqdm(range(n_layers), desc='bias_qkv', leave=False):
             qb,kb,vb = b_qkv_list[ii]; W(qb.reshape(-1)); W(kb.reshape(-1)); W(vb.reshape(-1))
-        for ii in range(n_layers): W(w_o_list[ii])
-        for ii in range(n_layers): W(b_o_list[ii].reshape(-1))
-        for ii in range(n_layers): W(sinks_list[ii].reshape(-1))
+        for ii in tqdm(range(n_layers), desc='o_proj', leave=False): W(w_o_list[ii])
+        for ii in tqdm(range(n_layers), desc='bias_o', leave=False): W(b_o_list[ii].reshape(-1))
+        for ii in tqdm(range(n_layers), desc='sinks', leave=False): W(sinks_list[ii].reshape(-1))
         if w_router_list and w_mlp1_list and w_mlp2_list:
-            for ii in range(len(w_router_list)): W(w_router_list[ii])
-            for ii in range(len(b_router_list)): W(b_router_list[ii].reshape(-1))
-            for ii in range(len(w_mlp1_list)): W(w_mlp1_list[ii])
-            for ii in range(len(b_mlp1_list)): W(b_mlp1_list[ii])
-            for ii in range(len(w_mlp2_list)): W(w_mlp2_list[ii])
-            for ii in range(len(b_mlp2_list)): W(b_mlp2_list[ii])
+            for ii in tqdm(range(len(w_router_list)), desc='router', leave=False): W(w_router_list[ii])
+            for ii in tqdm(range(len(b_router_list)), desc='bias_router', leave=False): W(b_router_list[ii].reshape(-1))
+            for ii in tqdm(range(len(w_mlp1_list)), desc='mlp1', leave=False): W(w_mlp1_list[ii])
+            for ii in tqdm(range(len(b_mlp1_list)), desc='bias_mlp1', leave=False): W(b_mlp1_list[ii])
+            for ii in tqdm(range(len(w_mlp2_list)), desc='mlp2', leave=False): W(w_mlp2_list[ii])
+            for ii in tqdm(range(len(b_mlp2_list)), desc='bias_mlp2', leave=False): W(b_mlp2_list[ii])
     print(f"[OK] Exported model to {out_path}")
 
 
