@@ -13,6 +13,23 @@ import numpy as np
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
+class TensorReader:
+    def __init__(self):
+        self._files = {}  # Path -> safe_open handle
+    def get_tensor(self, fp, key: str):
+        f = self._files.get(str(fp))
+        if f is None:
+            f = safe_open(fp, framework='pt')
+            self._files[str(fp)] = f
+        return f.get_tensor(key)
+    def close(self):
+        for f in list(self._files.values()):
+            try:
+                f.close()
+            except Exception:
+                pass
+        self._files.clear()
+
 I32_LE = "<i"
 F32_LE = "<f"
 
@@ -65,11 +82,10 @@ def open_all_safetensors(dir_path: Path) -> Dict[str, Tuple[Path, str]]:
             continue
     return m
 
-def load_tensor(fp: Path, key: str) -> np.ndarray:
-    with safe_open(fp, framework='pt') as f:
-        import torch
-        t=f.get_tensor(key)
-    if hasattr(t,'to'):
+def load_tensor_from(reader: TensorReader, fp: Path, key: str) -> np.ndarray:
+    import torch
+    t = reader.get_tensor(fp, key)
+    if hasattr(t, "to"):
         return t.detach().cpu().to(torch.float32).numpy()
     return np.array(t, dtype=np.float32)
 
@@ -289,16 +305,16 @@ def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
     )
 
     ktf = open_all_safetensors(model_dir)
+    reader = TensorReader()
     def K(*parts):
         return ".".join(parts)
-    def get(k):
-        if k not in ktf:
-            return None
+    def get_arr(k):
+        if k not in ktf: return None
         fp,_=ktf[k]
-        return load_tensor(fp,k)
+        return load_tensor_from(reader, fp, k)
     # Embeddings
-    token_embedding = get(K("model","embed_tokens","weight"))
-    out_weight = get("lm_head.weight")
+    token_embedding = get_arr(K("model","embed_tokens","weight"))
+    out_weight = get_arr("lm_head.weight")
     if token_embedding is None or out_weight is None:
         print("[ERROR] Missing embeddings in HF snapshot", file=sys.stderr)
         sys.exit(11)
@@ -308,42 +324,42 @@ def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
     w_router_list=[]; b_router_list=[]; w_mlp1_list=[]; b_mlp1_list=[]; w_mlp2_list=[]; b_mlp2_list=[]
 
     for i in range(n_layers):
-        rms_attn = get(K("model","layers",str(i),"input_layernorm","weight"))
-        rms_ffn = get(K("model","layers",str(i),"post_attention_layernorm","weight"))
+        rms_attn = get_arr(K("model","layers",str(i),"input_layernorm","weight"))
+        rms_ffn = get_arr(K("model","layers",str(i),"post_attention_layernorm","weight"))
         if rms_attn is None or rms_ffn is None:
             print(f"[ERROR] Missing norms for layer {i}", file=sys.stderr); sys.exit(12)
         rms_attn_list.append(rms_attn.reshape(-1))
         rms_ffn_list.append(rms_ffn.reshape(-1))
         # QKV fuse
-        q = get(K("model","layers",str(i),"self_attn","q_proj","weight"))
-        k = get(K("model","layers",str(i),"self_attn","k_proj","weight"))
-        v = get(K("model","layers",str(i),"self_attn","v_proj","weight"))
-        qb = get(K("model","layers",str(i),"self_attn","q_proj","bias"))
-        kb = get(K("model","layers",str(i),"self_attn","k_proj","bias"))
-        vb = get(K("model","layers",str(i),"self_attn","v_proj","bias"))
+        q = get_arr(K("model","layers",str(i),"self_attn","q_proj","weight"))
+        k = get_arr(K("model","layers",str(i),"self_attn","k_proj","weight"))
+        v = get_arr(K("model","layers",str(i),"self_attn","v_proj","weight"))
+        qb = get_arr(K("model","layers",str(i),"self_attn","q_proj","bias"))
+        kb = get_arr(K("model","layers",str(i),"self_attn","k_proj","bias"))
+        vb = get_arr(K("model","layers",str(i),"self_attn","v_proj","bias"))
         if any(x is None for x in (q,k,v,qb,kb,vb)):
             print(f"[ERROR] Missing QKV for layer {i}", file=sys.stderr); sys.exit(13)
         w_qkv_list.append(np.concatenate([q,k,v], axis=0))
         b_qkv_list.append(np.concatenate([qb.reshape(-1),kb.reshape(-1),vb.reshape(-1)], axis=0))
-        o = get(K("model","layers",str(i),"self_attn","o_proj","weight"))
-        ob = get(K("model","layers",str(i),"self_attn","o_proj","bias"))
+        o = get_arr(K("model","layers",str(i),"self_attn","o_proj","weight"))
+        ob = get_arr(K("model","layers",str(i),"self_attn","o_proj","bias"))
         if o is None or ob is None:
             print(f"[ERROR] Missing O for layer {i}", file=sys.stderr); sys.exit(14)
         w_o_list.append(o)
         b_o_list.append(ob.reshape(-1))
-        sinks = get(K("model","layers",str(i),"self_attn","sinks"))
+        sinks = get_arr(K("model","layers",str(i),"self_attn","sinks"))
         sinks_list.append(sinks.reshape(-1) if sinks is not None else np.zeros((n_attn_heads,),dtype=np.float32))
         # Router
-        wr = get(K("model","layers",str(i),"mlp","router","weight"))
-        br = get(K("model","layers",str(i),"mlp","router","bias"))
+        wr = get_arr(K("model","layers",str(i),"mlp","router","weight"))
+        br = get_arr(K("model","layers",str(i),"mlp","router","bias"))
         if wr is not None and br is not None and n_experts>0:
             w_router_list.append(wr.T)  # to (H, E)
             b_router_list.append(br.reshape(-1))
         # Experts
-        gu = get(K("model","layers",str(i),"mlp","experts","gate_up_proj"))
-        gub = get(K("model","layers",str(i),"mlp","experts","gate_up_proj_bias"))
-        dn = get(K("model","layers",str(i),"mlp","experts","down_proj"))
-        dnb = get(K("model","layers",str(i),"mlp","experts","down_proj_bias"))
+        gu = get_arr(K("model","layers",str(i),"mlp","experts","gate_up_proj"))
+        gub = get_arr(K("model","layers",str(i),"mlp","experts","gate_up_proj_bias"))
+        dn = get_arr(K("model","layers",str(i),"mlp","experts","down_proj"))
+        dnb = get_arr(K("model","layers",str(i),"mlp","experts","down_proj_bias"))
         if n_experts>0 and all(x is not None for x in (gu,gub,dn,dnb)):
             # gu: (E, H, 2I) -> (E, 2I, H)
             w_mlp1_list.append(np.transpose(gu,(0,2,1)))
@@ -383,14 +399,23 @@ def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
         def W(a):
             a=np.asarray(a, dtype=np.float32, order='C'); f.write(a.tobytes(order='C'))
         W(token_embedding); W(out_weight)
-        W(np.stack(rms_attn_list,0)); W(np.stack(rms_ffn_list,0)); W(rms_out.reshape(-1))
-        W(np.stack(w_qkv_list,0)); W(np.stack(b_qkv_list,0))
-        W(np.stack(w_o_list,0)); W(np.stack(b_o_list,0))
-        W(np.stack(sinks_list,0))
+        for ii in range(n_layers): W(rms_attn_list[ii].reshape(-1))
+        for ii in range(n_layers): W(rms_ffn_list[ii].reshape(-1))
+        W(rms_out.reshape(-1))
+        for ii in range(n_layers):
+            q,k,v = w_qkv_list[ii]; W(q); W(k); W(v)
+        for ii in range(n_layers):
+            qb,kb,vb = b_qkv_list[ii]; W(qb.reshape(-1)); W(kb.reshape(-1)); W(vb.reshape(-1))
+        for ii in range(n_layers): W(w_o_list[ii])
+        for ii in range(n_layers): W(b_o_list[ii].reshape(-1))
+        for ii in range(n_layers): W(sinks_list[ii].reshape(-1))
         if w_router_list and w_mlp1_list and w_mlp2_list:
-            W(np.stack(w_router_list,0)); W(np.stack(b_router_list,0))
-            W(np.stack(w_mlp1_list,0)); W(np.stack(b_mlp1_list,0))
-            W(np.stack(w_mlp2_list,0)); W(np.stack(b_mlp2_list,0))
+            for ii in range(len(w_router_list)): W(w_router_list[ii])
+            for ii in range(len(b_router_list)): W(b_router_list[ii].reshape(-1))
+            for ii in range(len(w_mlp1_list)): W(w_mlp1_list[ii])
+            for ii in range(len(b_mlp1_list)): W(b_mlp1_list[ii])
+            for ii in range(len(w_mlp2_list)): W(w_mlp2_list[ii])
+            for ii in range(len(b_mlp2_list)): W(b_mlp2_list[ii])
     print(f"[OK] Exported model to {out_path}")
 
 

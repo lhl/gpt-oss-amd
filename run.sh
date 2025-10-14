@@ -531,7 +531,7 @@ cmd_tokenizer() {
       [[ -n "${model_id}" ]] && print_kv "model-id" "${model_id}" || print_kv "snapshot" "${snapshot:-<unset>}"
       print_kv "revision" "${revision:-<unset>}"
       print_kv "out" "${out}"
-      local cmd=(python3 tools/export_model_bin.py -o "${out}")
+      local cmd=(env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 PYTORCH_NUM_THREADS=4 python3 tools/export_model_bin.py -o "${out}")
       [[ -n "${model_id}" ]] && cmd+=(--model-id "${model_id}")
       [[ -n "${revision}" ]] && cmd+=(--revision "${revision}")
       [[ -n "${snapshot}" ]] && cmd+=(--snapshot "${snapshot}")
@@ -624,7 +624,7 @@ main() {
       [[ -n "${model_id}" ]] && print_kv "model-id" "${model_id}" || print_kv "snapshot" "${snapshot:-<unset>}"
       print_kv "revision" "${revision:-<unset>}"
       print_kv "out" "${out}"
-      local cmd=(python3 tools/export_model_bin.py -o "${out}")
+      local cmd=(env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=4 PYTORCH_NUM_THREADS=4 python3 tools/export_model_bin.py -o "${out}")
       [[ -n "${model_id}" ]] && cmd+=(--model-id "${model_id}")
       [[ -n "${revision}" ]] && cmd+=(--revision "${revision}")
       [[ -n "${snapshot}" ]] && cmd+=(--snapshot "${snapshot}")
