@@ -1,0 +1,5 @@
+4
+Hello, world!
+What is the capital of France?
+Write a short haiku about autumn.
+Explain the significance of the ROCm WMMA on RDNA3.

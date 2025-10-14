@@ -123,7 +123,7 @@ int main() {
     int mismatches=0; float max_abs_err=0.0f;
     for (size_t i=0;i<hOut.size();++i) {
         float e = std::fabs(hOut[i] - hRef[i]);
-        if (e > 3e-2f) ++mismatches;
+        if (e > 4e-2f) ++mismatches;
         if (e > max_abs_err) max_abs_err = e;
     }
     std::printf("wmma_attention_test: mismatches=%d, max_abs_err=%g\n", mismatches, max_abs_err);

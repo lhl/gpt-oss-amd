@@ -34,17 +34,23 @@ class ExportConfig:
     sliding_window: int
     swiglu_limit: float
     def pack_le(self) -> bytes:
-        fields = (
-            self.vocab_size, self.hidden_dim, self.n_experts, self.experts_per_token,
-            self.intermediate_dim, self.n_layers, self.head_dim, self.n_attn_heads,
-            self.n_kv_heads, self.seq_len, self.initial_context_length,
-            self.rope_theta, self.rope_scaling_factor, self.sliding_window, self.swiglu_limit,
-        )
-        ints = fields[:10]
-        floats = fields[10:]
-        buf = b"".join(struct.pack(I32_LE, int(v)) for v in ints)
-        for v in floats:
-            buf += struct.pack(F32_LE, float(v))
+        # Must match src/run.cpp:Config field order and types exactly
+        buf = b""
+        buf += struct.pack(I32_LE, int(self.vocab_size))
+        buf += struct.pack(I32_LE, int(self.hidden_dim))
+        buf += struct.pack(I32_LE, int(self.n_experts))
+        buf += struct.pack(I32_LE, int(self.experts_per_token))
+        buf += struct.pack(I32_LE, int(self.intermediate_dim))
+        buf += struct.pack(I32_LE, int(self.n_layers))
+        buf += struct.pack(I32_LE, int(self.head_dim))
+        buf += struct.pack(I32_LE, int(self.n_attn_heads))
+        buf += struct.pack(I32_LE, int(self.n_kv_heads))
+        buf += struct.pack(I32_LE, int(self.seq_len))
+        buf += struct.pack(I32_LE, int(self.initial_context_length))
+        buf += struct.pack(F32_LE, float(self.rope_theta))
+        buf += struct.pack(F32_LE, float(self.rope_scaling_factor))
+        buf += struct.pack(I32_LE, int(self.sliding_window))
+        buf += struct.pack(F32_LE, float(self.swiglu_limit))
         return buf
 
 def open_all_safetensors(dir_path: Path) -> Dict[str, Tuple[Path, str]]:

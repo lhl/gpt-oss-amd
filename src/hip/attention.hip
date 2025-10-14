@@ -2,6 +2,10 @@
 #include "BLAS.hip"
 #include <cmath>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
+#ifdef OSS_USE_WMMA
+#include <rocwmma/rocwmma.hpp>
+#endif
 #include <limits>
 #include <stdint.h>
 #include <type_traits>
@@ -170,6 +174,11 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
     __shared__ short k_tile[BC_TILE][HEAD_DIM];
     __shared__ short v_tile[HEAD_DIM][BC_TILE];
     __shared__ short w_tile[BR_TILE][BC_TILE];
+#ifdef OSS_USE_WMMA
+    __shared__ hip_bfloat16 sA_wmma[16*16];
+    __shared__ hip_bfloat16 sB_wmma[16*16];
+    __shared__ float sC_wmma[16*16];
+#endif
 
     if (lane_id < BR_TILE) {
         row_m[lane_id] = NEG_INF;
@@ -266,6 +275,7 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
         __syncthreads();
 
         f4 score_frag = {0.f, 0.f, 0.f, 0.f};
+#ifndef OSS_USE_WMMA
 #pragma unroll
         for (int kk = 0; kk < HEAD_DIM; kk += MFMA_K) {
             const int frag_idx = kk / MFMA_K;
@@ -293,7 +303,56 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
 #endif
         }
 
-        float score_reg[4];
+        #else
+        // WMMA path: compute full 16x16 score tile across K using rocWMMA
+        {
+            const bool col_active = (lane_x < bc);
+            using namespace rocwmma;
+            fragment<accumulator, 16, 16, 16, rocwmma::float32_t> acc_frag;
+            if (lane_id < 32) {
+                fill_fragment(acc_frag, static_cast<rocwmma::float32_t>(0.0f));
+            }
+            for (int kk = 0; kk < HEAD_DIM; kk += 16) {
+                // Stage A: Q (rows x 16)
+                for (int idx2 = lane_id; idx2 < 256; idx2 += 64) {
+                    int r = idx2 / 16; int c = idx2 % 16; float qv = 0.0f;
+                    if (r < rows_active && (kk + c) < HEAD_DIM) {
+                        const float* __restrict__ q_row = q_block + (long long)(h_base + r) * HEAD_DIM;
+                        qv = q_row[kk + c] * inv_sqrt_d;
+                    }
+                    sA_wmma[r * 16 + c] = hip_bfloat16(qv);
+                }
+                // Stage B: K^T (16 x bc)
+                for (int idx2 = lane_id; idx2 < 256; idx2 += 64) {
+                    int r = idx2 / 16; int c = idx2 % 16; hip_bfloat16 kv = hip_bfloat16(0.0f);
+                    if (c < bc && (kk + r) < HEAD_DIM) {
+                        short kb = k_tile[c][kk + r]; kv = *reinterpret_cast<hip_bfloat16*>(&kb);
+                    }
+                    sB_wmma[r * 16 + c] = kv;
+                }
+                __syncthreads();
+                if (lane_id < 32) {
+                    fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major> a_frag;
+                    fragment<matrix_b, 16, 16, 16, bfloat16_t, row_major> b_frag;
+                    load_matrix_sync(a_frag, sA_wmma, 16);
+                    load_matrix_sync(b_frag, sB_wmma, 16);
+                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                }
+                __syncthreads();
+            }
+            if (lane_id < 32) {
+                store_matrix_sync(sC_wmma, acc_frag, 16, mem_row_major);
+            }
+            __syncthreads();
+            // Extract this lane's 4 rows at column lane_x
+            for (int i2 = 0; i2 < 4; ++i2) {
+                int row = lane_y * 4 + i2; float v = 0.0f;
+                if (col_active && row < rows_active) v = sC_wmma[row * 16 + lane_x];
+                score_frag[i2] = v;
+            }
+        }
+#endif
+float score_reg[4];
         float prob_reg[4];
 
         float mask_val = 0.0f;
@@ -438,13 +497,43 @@ fa2_decode_mfma_head64(const float* __restrict__ q_batch,                  // (B
         i16x4 vb3 = load_v_fragment(n_col3);
 
 #ifdef OSS_USE_WMMA
-        for (int i = 0; i < 4; ++i) {
-            float wf = bf16_to_f32_intr(raw_to_bf16(w_frag[i]));
-            o_frag0[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb0[i]));
-            o_frag1[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb1[i]));
-            o_frag2[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb2[i]));
-            o_frag3[i] += wf * bf16_to_f32_intr(raw_to_bf16(vb3[i]));
+        // WMMA aggregation: O += W[16xbc] @ V[bc x 16] per 16-col segment
+        // Stage A (W) once
+        for (int idx2 = lane_id; idx2 < 256; idx2 += 64) {
+            int r = idx2 / 16; int c = idx2 % 16; hip_bfloat16 wv = hip_bfloat16(0.0f);
+            if (r < rows_active && c < bc) { short wb = w_tile[r][c]; wv = *reinterpret_cast<__hip_bfloat16*>(&wb); }
+            sA_wmma[r * 16 + c] = wv;
         }
+        __syncthreads();
+        auto wmma_accum = [&](int n_col_base, f4 &o_frag) {
+            using namespace rocwmma;
+            fragment<accumulator, 16, 16, 16, rocwmma::float32_t> acc;
+            if (lane_id < 32) fill_fragment(acc, static_cast<rocwmma::float32_t>(0.0f));
+            for (int idx3 = lane_id; idx3 < 256; idx3 += 64) {
+                int r = idx3 / 16; int c = idx3 % 16; hip_bfloat16 vv = hip_bfloat16(0.0f);
+                if (r < bc && (n_col_base + c) < HEAD_DIM) { short vb = v_tile[n_col_base + c][r]; vv = *reinterpret_cast<__hip_bfloat16*>(&vb); }
+                sB_wmma[r * 16 + c] = vv;
+            }
+            __syncthreads();
+            if (lane_id < 32) {
+                fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major> a_frag;
+                fragment<matrix_b, 16, 16, 16, bfloat16_t, row_major> b_frag;
+                load_matrix_sync(a_frag, sA_wmma, 16);
+                load_matrix_sync(b_frag, sB_wmma, 16);
+                mma_sync(acc, a_frag, b_frag, acc);
+                store_matrix_sync(sC_wmma, acc, 16, mem_row_major);
+            }
+            __syncthreads();
+            for (int i4 = 0; i4 < 4; ++i4) {
+                int row = lane_y * 4 + i4; float add = 0.0f;
+                if (row < rows_active) add = sC_wmma[row * 16 + lane_x];
+                o_frag[i4] += add;
+            }
+        };
+        wmma_accum(n_col0, o_frag0);
+        wmma_accum(n_col1, o_frag1);
+        wmma_accum(n_col2, o_frag2);
+        wmma_accum(n_col3, o_frag3);
 #else
         o_frag0 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb0, o_frag0, 0, 0, 0);
         o_frag1 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(w_frag, vb1, o_frag1, 0, 0, 0);
