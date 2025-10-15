@@ -147,7 +147,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->att = reinterpret_cast<float*>(calloc(p->n_attn_heads * p->seq_len, sizeof(float)));
     s->logits = reinterpret_cast<float*>(calloc(p->vocab_size, sizeof(float)));
     s->mask = p->sliding_window > 0
-                  ? reinterpret_cast<float*>(calloc(p->seq_len * p->seq_len, sizeof(float)))
+                  ? reinterpret_cast<float*>(calloc((size_t)p->seq_len * (size_t)p->seq_len, sizeof(float)))
                   : NULL;
 
     // ensure all mallocs went fine
@@ -157,11 +157,15 @@ void malloc_run_state(RunState* s, Config* p) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
-    // initialize mask
-    for (int i = 0; i < p->seq_len; i++) {
-        for (int j = 0; j < p->seq_len; j++) {
-            if (p->sliding_window > 0 && i - j >= p->sliding_window) {
-                s->mask[i * p->seq_len + j] = -INFINITY; // Sliding window mask
+    // initialize mask (only if allocated)
+    if (s->mask != NULL && p->sliding_window > 0) {
+        for (int i = 0; i < p->seq_len; i++) {
+            const int base = i * p->seq_len;
+            const int j_end = i - p->sliding_window;
+            if (j_end > 0) {
+                for (int j = 0; j < j_end; j++) {
+                    s->mask[base + j] = -INFINITY;
+                }
             }
         }
     }
@@ -279,14 +283,19 @@ void load_checkpoint(char* ckpt, Config* config, TransformerWeights* weights, in
         fprintf(stderr, "mmap failed!\n");
         exit(EXIT_FAILURE);
     }
+    fprintf(stderr, "[run] mmap ok, file_size=%lld bytes\n", (long long)*file_size); fflush(stderr);
     float* weights_ptr = *data + sizeof(Config) / sizeof(float);
+    fprintf(stderr, "[run] mapping weights...\n"); fflush(stderr);
     memory_map_weights(weights, config, weights_ptr);
+    fprintf(stderr, "[run] mapped weights\n"); fflush(stderr);
 }
 
 void build_transformer(Transformer* t, char* ckpt_path) {
     // read in the Config and the Weights from the checkpoint
     load_checkpoint(ckpt_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+    fprintf(stderr, "[run] after load_checkpoint\n"); fflush(stderr);
     malloc_run_state(&t->state, &t->config);
+    fprintf(stderr, "[run] after malloc_run_state\n"); fflush(stderr);
 }
 
 void free_transformer(Transformer* t) {
@@ -1110,6 +1119,8 @@ void error_usage() {
 }
 
 int main(int argc, char** argv) {
+    fprintf(stderr, "[run] enter main\n"); fflush(stderr);
+    setvbuf(stdout, NULL, _IONBF, 0);
     // default parameters
     char* checkpoint_path = NULL; // e.g. out/model.bin
     const char* tokenizer_path = "build/tokenizer.bin";
@@ -1221,7 +1232,9 @@ int main(int argc, char** argv) {
 
     // build the Transformer via the model .bin file
     Transformer transformer;
+    fprintf(stderr, "[run] loading checkpoint: %s\n", checkpoint_path ? checkpoint_path : "<null>"); fflush(stderr);
     build_transformer(&transformer, checkpoint_path);
+    fprintf(stderr, "[run] checkpoint loaded. n_layers=%d, hidden_dim=%d\n", transformer.config.n_layers, transformer.config.hidden_dim); fflush(stderr);
     if (steps == 0 || steps > transformer.config.seq_len)
         steps = transformer.config.seq_len; // override to ~max length
 
