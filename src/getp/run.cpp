@@ -537,6 +537,11 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
     for (int b = 0; b < batch_size; b++) {
         int remaining = steps - 1 - num_prompt_tokens[b];
         max_generation_tokens[b] = remaining > 0 ? remaining : 0;
+        // Pre-initialize output buffers with a terminator so zero-generation cases
+        // produce an empty line instead of leaking uninitialized memory.
+        if (output_tokens_batch && output_tokens_batch[b]) {
+            output_tokens_batch[b][0] = -1;
+        }
     }
 
     const int progress_stride = 50;
@@ -563,8 +568,12 @@ long long generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* samp
             active_sequences--;
             if (output_tokens_batch[b_idx]) {
                 int end_idx = pos[b_idx] - num_prompt_tokens[b_idx] + 1;
+                // If we generated >=0 tokens, terminate at end_idx; otherwise
+                // ensure index 0 is a terminator to indicate empty output.
                 if (end_idx >= 0) {
                     output_tokens_batch[b_idx][end_idx] = -1;
+                } else {
+                    output_tokens_batch[b_idx][0] = -1;
                 }
             }
         }
