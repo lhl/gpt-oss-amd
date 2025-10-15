@@ -363,8 +363,8 @@ def export_hf_gpt_oss(model_dir: Path, out_path: Path) -> None:
         vb = get_arr(K("model","layers",str(i),"self_attn","v_proj","bias"))
         if any(x is None for x in (q,k,v,qb,kb,vb)):
             print(f"[ERROR] Missing QKV for layer {i}", file=sys.stderr); sys.exit(13)
-        w_qkv_list.append(np.concatenate([q,k,v], axis=0))
-        b_qkv_list.append(np.concatenate([qb.reshape(-1),kb.reshape(-1),vb.reshape(-1)], axis=0))
+        w_qkv_list.append((q,k,v))
+        b_qkv_list.append((qb,kb,vb))
         o = get_arr(K("model","layers",str(i),"self_attn","o_proj","weight"))
         ob = get_arr(K("model","layers",str(i),"self_attn","o_proj","bias"))
         if o is None or ob is None:
