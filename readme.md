@@ -1,3 +1,262 @@
+# HOWTO
+WMMA port for RDNA3.x (tested for gfx1151 Strix Halo)
+
+## Prereqs
+- ROCm + HIP installed (hipcc, rocminfo available).
+- Python packages for exporter: pip install numpy safetensors huggingface_hub tqdm
+- Optional (if dequantizing HF quantized weights): pip install accelerate transformers
+
+## Checkout
+```
+git clone https://github.com/lhl/gpt-oss-amd.git
+cd gpt-oss-amd
+```
+- Quick check: `hipcc --version && rocminfo | rg -m1 gfx || true`
+
+## Build
+```
+./run.sh build  (OMP flavor; builds build/run)
+
+```
+- If gfx11/Strix Halo, WMMA path is auto-enabled on detection. To be explicit: GPU_ARCH=gfx1151 make runomp
+
+## Quick Tests (GPU WMMA kernels)
+```
+GPU_ARCH=gfx1151 ./run.sh test -t 60
+```
+- Runs: WMMA GEMM + attention unit tests; expect small bf16 errors and mismatches=0.
+
+## Export Model (.bin)
+First your probably need to dequant BF16 safetensors (eg MXFP4 models):
+```
+python3 tools/dequantize_to_bf16.py 20b --src /path/to/hf_snapshot --dst /path/to/gpt-oss-20b-bf16
+```
+Then you can export from the BF16:
+```
+./run.sh export --snapshot /path/to/gpt-oss-20b-bf16 -o gpt-oss-20b.bin
+```
+- Tip: Print available keys: `./run.sh export --model-id openai/gpt-oss-20b -o /tmp/x.bin --print-keys`
+
+## GPU E2E Smoke (getp)
+- Short run (blocking enabled by default for stability):
+```
+./run.sh run -c ./gpt-oss-20b.bin -m getp -n 64 -b 1 -t 4 -f
+```
+- Defaults input/output to tests/data/{input,output}.txt (creates input if missing).
+- Use --no-blocking to disable HIP_LAUNCH_BLOCKING=1.
+
+Generate GT with CPU & Verify (optional, recommended)
+- Generate a CPU ground-truth token ID file (greedy):
+  - `./run.sh run -c ./gpt-oss-20b.bin -m getp_cpu -i tests/data/input.txt -o tests/gt/output_20b.txt -n 64 -t 4`
+- Run GPU and verify against GT:
+  - `./run.sh run -c ./gpt-oss-20b.bin -m getp -n 64 -b 1 -t 4 -f -v tests/gt/output_20b.txt`
+
+Decode Output (optional)
+- Decode token IDs to text:
+  - `./run.sh decode -i tests/data/output.txt -l`
+  - Saves to gt_decoded.txt.
+
+## Troubleshooting
+- ROCm libs not found: export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+- Slurm available: add FORCE_SRUN=1 to force srun.
+- If you see HIP “unspecified launch failure,” keep blocking ON (default) or re-run with HIP_LAUNCH_BLOCKING=1.
+
+## Sample Output
+
+~2 Minutes to generate output verification on CPU:
+```
+🐟 ❯ ./run.sh run -c ./gpt-oss-20b.bin -m getp_cpu -i tests/data/input.txt -o tests/gt/output_20b.txt -n 64 -t 4
+                      __
+                     |  \
+  ______    ______  _| $$_           ______    _______   _______
+ /      \  /      \|   $$ \ ______  /      \  /       \ /       \
+|  $$$$$$\|  $$$$$$\$$$$$$|      \|  $$$$$$\|  $$$$$$$$
+| $$  | $$| $$  | $$ | $$ __\$$$$$$| $$  | $$ \$$    \  \$$$    \
+| $$__| $$| $$__/ $$ | $$|  \      | $$__/ $$ _\$$$$$$\ _\$$$$$$\
+ \$$    $$| $$    $$  \$$  $$       \$$    $$|       $$|       $$
+ _\$$$$$$$| $$$$$$$$    \$$$$         \$$$$$$  \$$$$$$$  \$$$$$$$
+|  \__| $$| $$
+ \$$    $$| $$
+  \$$$$$$  \$$
+  ════════════════════════════════════════════════════════════════
+                       gpt-oss-amd from scratch
+              https://github.com/tuanlda78202/gpt-oss-amd
+  ════════════════════════════════════════════════════════════════
+
+==================================================================
+[RUN] 2025-10-15 12:01:12
+  cwd           : /home/lhl/gpt-oss-amd
+  MODELBIN_ROOT : /gpu_trainee/final-project/modelbin
+  checkpoint    : ./gpt-oss-20b.bin
+  mode          : getp_cpu (provided)
+  gpus(-g)      : 1 (default)
+  input(-i)     : tests/data/input.txt (provided)
+  output(-o)    : tests/gt/output_20b.txt (provided)
+  tokenizer(-z) : <unset>
+  system(-y)    : <unset>
+  temp(-T)      : 0.0 (run.cpp default)
+  top_p(-p)     : 0.9 (run.cpp default)
+  steps(-n)     : 64 (provided)
+  seed(-s)      : time(NULL) (run.cpp default)
+  batch_size(-b): 32 (run.cpp default)
+  profiling(-f) :  (disabled)
+  logging(-l)   :  (disabled)
+  truncate(-t)  : 4 (limit to first 4 lines)
+  kv_cache      : bf16 (default)
+  blocking      : enabled (HIP_LAUNCH_BLOCKING)
+>>> env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib HIP_LAUNCH_BLOCKING=1 build/run "./gpt-oss-20b.bin" -m getp_cpu -i tests/data/input.txt -o tests/gt/output_20b.txt -n 64 -t 4
+ EXECUTING: env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib HIP_LAUNCH_BLOCKING=1 build/run "./gpt-oss-20b.bin" -m getp_cpu -i tests/data/input.txt -o tests/gt/output_20b.txt -n 64 -t 4
+[run] enter main
+📊 PROFILING DISABLED
+[run] loading checkpoint: ./gpt-oss-20b.bin
+vocab_size: 201088
+hidden_dim: 2880
+n_experts: 32
+experts_per_token: 4
+intermediate_dim: 2880
+n_layers: 24
+head_dim: 64
+n_attn_heads: 64
+n_kv_heads: 8
+max_seq_len: 131072
+init context len: 4096
+rope theta: 150000.000000
+rope_scaling_factor: 32.000000
+sliding window: 128
+swiglu_limit: 7.000000
+[run] mmap ok, file_size=83659028796 bytes
+[run] mapping weights...
+[run] mapped weights
+[run] after load_checkpoint
+[run] after malloc_run_state
+[run] checkpoint loaded. n_layers=24, hidden_dim=2880
+```
+
+About 3 minutes for GPU inference test:
+```
+🐟 ❯ ./run.sh run -c ./gpt-oss-20b.bin -m getp -n 64 -b 1 -t 4 -f
+                      __
+                     |  \
+  ______    ______  _| $$_           ______    _______   _______
+ /      \  /      \|   $$ \ ______  /      \  /       \ /       \
+|  $$$$$$\|  $$$$$$\$$$$$$|      \|  $$$$$$\|  $$$$$$$$
+| $$  | $$| $$  | $$ | $$ __\$$$$$$| $$  | $$ \$$    \  \$$$    \
+| $$__| $$| $$__/ $$ | $$|  \      | $$__/ $$ _\$$$$$$\ _\$$$$$$\
+ \$$    $$| $$    $$  \$$  $$       \$$    $$|       $$|       $$
+ _\$$$$$$$| $$$$$$$$    \$$$$         \$$$$$$  \$$$$$$$  \$$$$$$$
+|  \__| $$| $$
+ \$$    $$| $$
+  \$$$$$$  \$$
+  ════════════════════════════════════════════════════════════════
+                       gpt-oss-amd from scratch
+              https://github.com/tuanlda78202/gpt-oss-amd
+  ════════════════════════════════════════════════════════════════
+
+==================================================================
+[RUN] 2025-10-15 12:04:29
+  cwd           : /home/lhl/gpt-oss-amd
+  MODELBIN_ROOT : /gpu_trainee/final-project/modelbin
+  checkpoint    : ./gpt-oss-20b.bin
+  mode          : getp (default)
+( model)
+  gpus(-g)      : 1 (default)
+  input(-i)     : tests/data/input.txt (run.sh default for getp)
+  output(-o)    : tests/data/output.txt (run.sh default for getp)
+  verify(-v)    : tests/gt/output_20b.txt (run.sh default for getp)
+  tokenizer(-z) : <unset>
+  system(-y)    : <unset>
+  temp(-T)      : 0.0 (run.cpp default)
+  top_p(-p)     : 0.9 (run.cpp default)
+  steps(-n)     : 64 (provided)
+  seed(-s)      : time(NULL) (run.cpp default)
+  batch_size(-b): 1 (provided)
+  profiling(-f) : enabled (forward timing)
+  logging(-l)   :  (disabled)
+  truncate(-t)  : 4 (limit to first 4 lines)
+  kv_cache      : bf16 (default)
+  blocking      : enabled (HIP_LAUNCH_BLOCKING)
+>>> env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib HIP_LAUNCH_BLOCKING=1 build/run "./gpt-oss-20b.bin" -m getp -i tests/data/input.txt -o tests/data/output.txt -n 64 -b 1 -f 1 -v tests/gt/output_20b.txt -t 4
+ EXECUTING: env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib:/opt/rocm/lib HIP_LAUNCH_BLOCKING=1 build/run "./gpt-oss-20b.bin" -m getp -i tests/data/input.txt -o tests/data/output.txt -n 64 -b 1 -f 1 -v tests/gt/output_20b.txt -t 4
+[run] enter main
+📊 PROFILING ENABLED
+[run] loading checkpoint: ./gpt-oss-20b.bin
+vocab_size: 201088
+hidden_dim: 2880
+n_experts: 32
+experts_per_token: 4
+intermediate_dim: 2880
+n_layers: 24
+head_dim: 64
+n_attn_heads: 64
+n_kv_heads: 8
+max_seq_len: 131072
+init context len: 4096
+rope theta: 150000.000000
+rope_scaling_factor: 32.000000
+sliding window: 128
+swiglu_limit: 7.000000
+[run] mmap ok, file_size=83659028796 bytes
+[run] mapping weights...
+[run] mapped weights
+[run] after load_checkpoint
+[run] after malloc_run_state
+[run] checkpoint loaded. n_layers=24, hidden_dim=2880
+requests size = 66560 B
+num requests: 4
+==================================================================
+🔥 WARMING UP...
+[Parallel Config] dp=1, ep=1, devices=1 (available=1), batch_size=1
+GPU 0 (AMD Radeon Graphics): 120.0 GB free / 120.0 GB total
+Using 16-bit KV cache (bfloat16) with cyclic buffers
+Converting and transferring weights...
+  token_embedding_table (1.1 GB)... done
+  out (1.1 GB)... done
+✅ Hybrid precision model loaded: 39.1 GB allocated
+
+--- HYBRID WARM-UP COMPLETE (device 0 | dp=0 ep=0) ---
+GPU Memory Status: Total 120.00 GB, Used 39.14 GB, Free 80.86 GB
+-----------------------------------------------
+⌛️ Warm up (s): 49.612000
+==================================================================
+⚡️ RUNNING INFERENCE...
+🚀 [DP device 0] Ready with batch_size = 1
+#1: Hello |
+#1  ●●●●●●●●●●●●●●●● ✓ Done
+
+┌─────────────────────────────┐
+│ ⌛️ Time: 110.591000         │
+│ ⚡️ TPS: 2.016439            │
+└─────────────────────────────┘
+==================================================================
+🔍 VERIFYING OUTPUT...
+⚠️ Request #1: Length mismatch (GT: 61 tokens, Generated: 60 tokens)
+⚠️ Request #2: Length mismatch (GT: 58 tokens, Generated: 57 tokens)
+⚠️ Request #3: Length mismatch (GT: 57 tokens, Generated: 56 tokens)
+⚠️ Request #4: Length mismatch (GT: 51 tokens, Generated: 50 tokens)
+
+📊 Verification Summary:
+Total requests checked: 4
+Requests with mismatches: 4
+Requests matching: 0
+❌ TESTS FAILED! 4 requests have mismatches.
+==================================================================
+♻️  FREE GPU MEMORY...
+GPU memory: 119.9 GB free / 120.0 GB total
+
+--- HYBRID FINISH COMPLETE ---
+GPU Memory Status:
+  Total: 120.00 GB
+  Used: 0.14 GB
+  Free: 119.86 GB
+-------------------------------
+⌛️ Finish (s): 0.247000
+❌ Verification: FAILED
+```
+
+Original upstream README below:
+
+---
+
 <div align="center">
 
 # GPT-OSS from Scratch on AMD GPUs
