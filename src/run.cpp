@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fstream>
+#include <string>
+#include <vector>
 #if defined _WIN32
 #include "win.h"
 #else
@@ -1081,6 +1084,93 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     free(prompt_tokens);
 }
 
+// ----------------------------------------------------------------------------
+// CPU validation: getp-style batch driver that writes token IDs per line
+
+static void getp_cpu(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
+                     const char* input_filename, const char* output_filename, int steps,
+                     int truncate_lines) {
+    if (!input_filename || !output_filename) {
+        fprintf(stderr, "getp_cpu: missing input/output filename\n");
+        exit(EXIT_FAILURE);
+    }
+    std::ifstream fin(input_filename);
+    if (!fin.is_open()) {
+        fprintf(stderr, "getp_cpu: cannot open input file: %s\n", input_filename);
+        exit(EXIT_FAILURE);
+    }
+    int total = 0;
+    std::string header;
+    if (std::getline(fin, header)) {
+        total = atoi(header.c_str());
+    } else {
+        fprintf(stderr, "getp_cpu: empty input file: %s\n", input_filename);
+        exit(EXIT_FAILURE);
+    }
+    if (truncate_lines > 0 && truncate_lines < total)
+        total = truncate_lines;
+    std::vector<std::string> prompts;
+    prompts.reserve((size_t)total);
+    for (int i = 0; i < total; ++i) {
+        std::string line;
+        if (!std::getline(fin, line)) break;
+        prompts.push_back(line);
+    }
+    fin.close();
+
+    std::ofstream fout(output_filename);
+    if (!fout.is_open()) {
+        fprintf(stderr, "getp_cpu: cannot open output file: %s\n", output_filename);
+        exit(EXIT_FAILURE);
+    }
+    const int eos1 = 199999, eos2 = 200002;
+    int max_total_steps = steps;
+    if (max_total_steps == 0 || max_total_steps > transformer->config.seq_len)
+        max_total_steps = transformer->config.seq_len;
+
+    for (size_t pi = 0; pi < prompts.size(); ++pi) {
+        const std::string& prompt = prompts[pi];
+        int num_prompt_tokens = 0;
+        int* prompt_tokens = (int*)malloc((prompt.size() + 3) * sizeof(int));
+        encode(tokenizer, prompt.c_str(), -1, -1, prompt_tokens, &num_prompt_tokens,
+               transformer->config.initial_context_length);
+        if (num_prompt_tokens < 1) {
+            fout << "\n";
+            free(prompt_tokens);
+            continue;
+        }
+        int pos = 0;
+        int token = prompt_tokens[0];
+        std::vector<int> out_ids;
+        out_ids.reserve(128);
+        while (pos < max_total_steps) {
+            float* logits = forward(transformer, token, pos);
+            int next;
+            bool generated = false;
+            if (pos < num_prompt_tokens - 1) {
+                next = prompt_tokens[pos + 1];
+            } else {
+                next = sample(sampler, logits);
+                generated = true;
+            }
+            pos++;
+            if (generated) {
+                if (next == eos1 || next == eos2)
+                    break;
+                out_ids.push_back(next);
+            }
+            token = next;
+        }
+        for (size_t i = 0; i < out_ids.size(); ++i) {
+            if (i) fout << ' ';
+            fout << out_ids[i];
+        }
+        fout << '\n';
+        free(prompt_tokens);
+    }
+    fout.close();
+}
+
 #ifndef OSS_ENABLE_GETP
 #define OSS_ENABLE_GETP 1
 #endif
@@ -1109,7 +1199,7 @@ void error_usage() {
     fprintf(stderr, "  -i <string> input file in getp mode or input prompt in other modes\n");
     fprintf(stderr, "  -o <string> output file in getp mode\n");
     fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat|getp, default: generate\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat|getp|getp_cpu, default: generate\n");
     fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
     fprintf(stderr, "  -b <int>    batch size for getp mode, default 32\n");
     fprintf(stderr, "  -f <0|1>    enable forward profiling (0=off, 1=on), default 0\n");
@@ -1262,6 +1352,16 @@ int main(int argc, char** argv) {
         free_transformer(&transformer);
         return 1;
 #endif
+    } else if (strcmp(mode, "getp_cpu") == 0) {
+        if (!input_filename || !output_filename) {
+            fprintf(stderr, "getp_cpu requires -i <input> and -o <output>\n");
+            free_sampler(&sampler);
+            free_tokenizer(&tokenizer);
+            free_transformer(&transformer);
+            return 1;
+        }
+        getp_cpu(&transformer, &tokenizer, &sampler, input_filename, output_filename, steps,
+                 truncate_lines);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         error_usage();
