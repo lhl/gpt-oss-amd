@@ -26,11 +26,11 @@ endif
 # Also disable getp until all kernels are ported.
 ifeq ($(GPU_ARCH),auto)
   ifneq (,$(findstring gfx11,$(DETECTED_ARCH)))
-    CFLAGS += -DOSS_USE_WMMA=1 -IrocWMMA/library/include
+    CFLAGS += -DOSS_USE_WMMA=1 -Iwmma-reference/rocWMMA/library/include
   endif
 else
   ifneq (,$(findstring gfx11,$(GPU_ARCH)))
-    CFLAGS += -DOSS_USE_WMMA=1 -IrocWMMA/library/include
+    CFLAGS += -DOSS_USE_WMMA=1 -Iwmma-reference/rocWMMA/library/include
   endif
 endif
 
@@ -57,13 +57,13 @@ decode: src/decode.cpp src/tokenizer.cpp tokenizer-bin
 
 .PHONY: wmma-test
 wmma-test: tests/wmma_gemm_test.cpp src/hip/BLAS.hip src/hip/gemms/gemm_logits.hip
-	$(CC) $(CFLAGS) -DTESTING -DOSS_USE_WMMA=1 -IrocWMMA/library/include -O3 \
+	$(CC) $(CFLAGS) -DTESTING -DOSS_USE_WMMA=1 -Iwmma-reference/rocWMMA/library/include -O3 \
 	  tests/wmma_gemm_test.cpp src/hip/gemms/gemm_logits.hip -o build/wmma_test
 
 .PHONY: wmma-gemm-bias-test
 wmma-gemm-bias-test: tests/wmma_gemm_bias_test.cpp \
     src/hip/gemms/gemm_qkv.hip src/hip/gemms/gemm_o.hip src/hip/gemms/gemm_router.hip
-	$(CC) $(CFLAGS) -DTESTING -DOSS_USE_WMMA=1 -IrocWMMA/library/include -O3 \
+	$(CC) $(CFLAGS) -DTESTING -DOSS_USE_WMMA=1 -Iwmma-reference/rocWMMA/library/include -O3 \
 	  tests/wmma_gemm_bias_test.cpp \
 	  src/hip/gemms/gemm_qkv.hip src/hip/gemms/gemm_o.hip src/hip/gemms/gemm_router.hip \
 	  -o build/wmma_gemm_bias_test
@@ -92,5 +92,5 @@ quick-tests: wmma-test wmma-gemm-bias-test wmma-attn-test
 
 .PHONY: wmma-attn-test
 wmma-attn-test: tests/wmma_attention_test.cpp src/hip/attention.hip
-	$(CC) $(CFLAGS) -DTESTING -DOSS_USE_WMMA=1 -IrocWMMA/library/include -O3 \
+	$(CC) $(CFLAGS) -DTESTING -DOSS_USE_WMMA=1 -Iwmma-reference/rocWMMA/library/include -O3 \
 	  tests/wmma_attention_test.cpp src/hip/attention.hip -o build/wmma_attention_test

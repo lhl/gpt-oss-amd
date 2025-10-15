@@ -1,0 +1,16 @@
+[submodule "amd_matrix_instruction_calculator"]
+	path = wmma-reference/amd_matrix_instruction_calculator
+    url = https://github.com/ROCm/amd_matrix_instruction_calculator
+
+[submodule "flash-attention-v2-RDNA3-minimal"]
+	path = wmma-reference/flash-attention-v2-RDNA3-minimal
+    url = https://github.com/Repeerc/flash-attention-v2-RDNA3-minimal
+
+[submodule "rocWMMA"]
+	path = wmma-reference/rocWMMA
+    url = https://github.com/ROCm/rocWMMA
+
+[submodule "rocm_wmma_samples"]
+	path = wmma-reference/rocm_wmma_samples
+    url = https://github.com/adelj88/rocm_wmma_samples
+
