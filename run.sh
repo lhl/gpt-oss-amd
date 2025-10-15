@@ -91,7 +91,7 @@ usage() {
   echo ""
   echo -e "${RED}🏃‍♂️ RUN COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh run [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
-  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE]${NC}"
+  echo -e "                ${GREEN}[-T TEMP] [-t TRUNCATE] [-p TOP_P] [-n STEPS] [-s SEED] [-l] [-g N_GPUS] [-b BATCH_SIZE] [-f] [-v VERIFY_FILE] [--blocking|--no-blocking]${NC}"
   echo ""
   echo -e "  ${CYAN}Key Features:${NC}"
   echo -e "    • Default checkpoint: ${WHITE}${MODELBIN_ROOT}/gpt-oss-20b.bin${NC}"
@@ -127,6 +127,7 @@ usage() {
   echo -e "    ${WHITE}-v VERIFY_FILE${NC}         Ground truth file for verification (default: tests/gt/output_20b.txt)"
   echo -e "    ${WHITE}--kv16${NC}                 Use 16-bit KV cache (bfloat16, default)"
   echo -e "    ${WHITE}--kv32${NC}                 Use 32-bit KV cache (override kv16)"
+  echo -e "    ${WHITE}--blocking | --no-blocking${NC}  Enable/disable HIP_LAUNCH_BLOCKING (default: enabled)"
   echo ""
   echo -e "${PURPLE}🔄 ALL-IN-ONE COMMANDS:${NC}"
   echo -e "  ${GREEN}./run.sh all [-c] [--checkpoint PATH|-c PATH] [-m MODE] [-i INPUT] [-o OUTPUT] [-z TOKENIZER] [-y SYS]${NC}"
@@ -270,6 +271,7 @@ cmd_run() {
   local kv16_flag=""
   local kv32_flag=""
   local odd_win=""
+  local hip_blocking="1"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -292,6 +294,8 @@ cmd_run() {
       --kv16) kv16_flag="1"; shift 1 ;;
       --kv32) kv32_flag="1"; shift 1 ;;
       --odd_win) odd_win="$2"; shift 2 ;;
+      --blocking) hip_blocking="1"; shift 1 ;;
+      --no-blocking) hip_blocking="0"; shift 1 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -378,6 +382,7 @@ EOF
   else
     print_kv "kv_cache" "bf16" "(default)"
   fi
+  print_kv "blocking" "$( [[ "${hip_blocking}" == "1" ]] && echo enabled || echo disabled )" "(HIP_LAUNCH_BLOCKING)"
   [[ -n "${odd_win}" ]] && print_kv "odd_win" "${odd_win}" "(--odd_win)"
 
   if [[ ! -x build/run ]]; then
@@ -385,6 +390,9 @@ EOF
   fi
 
   local RUN_ENV="LD_LIBRARY_PATH=/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+  if [[ "${hip_blocking}" == "1" ]]; then
+    RUN_ENV+=" HIP_LAUNCH_BLOCKING=1"
+  fi
   local args=()
   [[ -n "${mode}" ]] && args+=(-m "${mode}")
   [[ -n "${inp}"  ]] && args+=(-i "${inp}")
@@ -415,26 +423,26 @@ EOF
   fi
 
   if [[ ${#runner_cmd[@]} -gt 0 ]]; then
-    print_command "${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-}"
+    print_command "env ${RUN_ENV} ${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-}"
   else
-    print_command "build/run \"${ckpt}\" ${args[*]:-}"
+    print_command "env ${RUN_ENV} build/run \"${ckpt}\" ${args[*]:-}"
   fi
 
   if [[ -n "${log_output}" ]]; then
     print_info "logging output to log.txt"
     if [[ ${#runner_cmd[@]} -gt 0 ]]; then
-      print_executing "${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
-      env ${RUN_ENV} "${runner_cmd[@]}" env ${RUN_ENV} env ${RUN_ENV} build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
+      print_executing "env ${RUN_ENV} ${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
+      env ${RUN_ENV} "${runner_cmd[@]}" build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
     else
-      print_executing "build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
-      env ${RUN_ENV} env ${RUN_ENV} build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
+      print_executing "env ${RUN_ENV} build/run \"${ckpt}\" ${args[*]:-} | tee log.txt"
+      env ${RUN_ENV} build/run "${ckpt}" "${args[@]:-}" 2>&1 | tee log.txt
     fi
   else
     if [[ ${#runner_cmd[@]} -gt 0 ]]; then
-      print_executing "${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-}"
-      env ${RUN_ENV} "${runner_cmd[@]}" env ${RUN_ENV} build/run "${ckpt}" "${args[@]:-}"
+      print_executing "env ${RUN_ENV} ${runner_cmd[*]} build/run \"${ckpt}\" ${args[*]:-}"
+      env ${RUN_ENV} "${runner_cmd[@]}" build/run "${ckpt}" "${args[@]:-}"
     else
-      print_executing "build/run \"${ckpt}\" ${args[*]:-}"
+      print_executing "env ${RUN_ENV} build/run \"${ckpt}\" ${args[*]:-}"
       env ${RUN_ENV} build/run "${ckpt}" "${args[@]:-}"
     fi
   fi
