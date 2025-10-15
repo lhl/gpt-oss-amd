@@ -85,3 +85,4 @@ time_log.py
 tests/submission/input.txt
 tests/submission/output.txt
 log*.txt
+tests/data/output.txt
