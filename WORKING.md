@@ -3,7 +3,7 @@ Status: gfx11 (Strix Halo) enablement in progress
 Summary
 - Build: Successful on gfx1151 with WMMA enabled; getp re-enabled for gfx11.
 - Implemented: WMMA-based GEMMs for logits, QKV, O, Router (using rocWMMA). MFMA kept for gfx9x.
-- Attention: Port in progress. For gfx11, MFMA ops are replaced by a scalar BF16 fallback inside the FA2 kernel to enable functional execution while WMMA attention is implemented (correctness-first; slower).
+- Attention: WMMA attention implemented on gfx11 (rocWMMA fragments for Q·K^T and scores·V); MFMA path retained for gfx9x. Scalar fallback removed when WMMA is enabled.
 - MoE: gfx11-safe fallback implemented (replaces MFMA inner loops with scalar BF16 accumulates) for MLP1/MLP2; functional on gfx11.
 - Tests: Added fast unit tests for WMMA GEMMs (logits/QKV/O/Router) with optional timeout; all pass within ~15s on gfx1151.
 
@@ -33,7 +33,7 @@ What works now
 - Quick tests: `./run.sh test -t 30` (uses make quick-tests with timeout)
 
 What is gated/off
-- getp mode is enabled on gfx11 again (was previously gated). Attention uses a scalar fallback; MoE uses scalar fallback; performance will be lower than MFMA.
+- getp mode is enabled on gfx11 again (was previously gated). Attention uses WMMA on gfx11; MoE uses scalar fallback; performance will be lower than MFMA until MoE WMMA lands.
 
 Key files touched
 - Makefile: GPU arch detection, WMMA enable, quick-tests
@@ -57,7 +57,7 @@ How to run quick tests
 
 Next steps (short term)
 - Attention (WMMA):
-  - Replace scalar fallback with WMMA fragments for Q·K^T and V aggregation (head_dim=64 tiles)
+  - [Done] Replace scalar fallback with WMMA fragments for Q·K^T and V aggregation (head_dim=64 tiles)
   - [Done] Validate with a targeted attention unit test (small B,H,T); integrated into quick-tests
 - MoE (WMMA or fallback):
   - MLP1/MLP2 kernels: upgrade from scalar fallback to WMMA where dense; keep fallback otherwise
@@ -66,7 +66,7 @@ Next steps (short term)
   - Or explicitly pass your exported checkpoint: `./run.sh run -c ./gpt-oss-20b.bin -m getp -i tests/data/input.txt -o tests/data/output.txt -n 64 -b 1 -t 4 -f`
 
 Todo checklist
-- [ ] Implement WMMA attention tiles (Q·K^T and scores·V), replace scalar fallback
+- [x] Implement WMMA attention tiles (Q·K^T and scores·V), replace scalar fallback
 - [x] Add attention unit test (unmasked, small shapes) and include in quick-tests
 - [ ] (Optional) Implement WMMA in MoE MLP1/MLP2 where dense; retain scalar fallback for sparse cases
 - [ ] Run end-to-end getp smoke on gfx11 with a small batch/step budget
